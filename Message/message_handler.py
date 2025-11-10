@@ -4,29 +4,34 @@
 """
 from typing import Dict, Any, List, Set, Callable, Awaitable
 from datetime import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from Message.message_consumer import MessageHandler
 from bridge.context import Context, ContextType, ChannelType
 from utils.logger import get_logger
+from utils.resource_manager import ThreadResourceManager
+from utils.performance_monitor import monitor_async_function
 from Channel.pinduoduo.utils.API.send_message import SendMessage
 
 
 class AIAutoReplyHandler(MessageHandler):
     """AI自动回复处理器 - 集成CozeBot智能回复"""
     
-    def __init__(self, bot=None, auto_reply_types: Set[ContextType] = None, enable_fallback: bool = True):
+    def __init__(self, bot=None, auto_reply_types: Set[ContextType] = None, enable_fallback: bool = True, max_workers: int = 5):
         """
         初始化AI自动回复处理器
-        
+
         Args:
             bot: AI Bot实例 (如CozeBot)
             auto_reply_types: 支持自动回复的消息类型
             enable_fallback: 是否启用规则回复作为后备
+            max_workers: 线程池最大工作线程数
         """
         self.bot = bot
         self.auto_reply_types = auto_reply_types or {
-            ContextType.TEXT, 
-            ContextType.GOODS_INQUIRY, 
+            ContextType.TEXT,
+            ContextType.GOODS_INQUIRY,
             ContextType.GOODS_SPEC,
             ContextType.ORDER_INFO,
             ContextType.IMAGE,
@@ -34,8 +39,20 @@ class AIAutoReplyHandler(MessageHandler):
             ContextType.EMOTION
         }
         self.enable_fallback = enable_fallback
+        self.max_workers = max_workers
         self.logger = get_logger()
-        
+
+        # 创建专用的线程池资源管理器
+        self.resource_manager = ThreadResourceManager()
+        self.executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="ai_handler"
+        )
+        self.resource_manager.register_thread_pool(
+            self.executor,
+            f"AI处理器线程池(max_workers={max_workers})"
+        )
+
         # 如果没有提供bot实例，尝试创建默认的CozeBot
         if not self.bot:
             try:
@@ -45,6 +62,14 @@ class AIAutoReplyHandler(MessageHandler):
             except Exception as e:
                 self.logger.warning(f"创建AI Bot失败: {e}，将使用规则回复")
                 self.bot = None
+
+    def __del__(self):
+        """析构函数，确保线程池被正确关闭"""
+        try:
+            if hasattr(self, 'resource_manager'):
+                asyncio.create_task(self.resource_manager.cleanup_all())
+        except Exception as e:
+            self.logger.error(f"清理AI处理器资源失败: {e}")
     
     def can_handle(self, context: Context) -> bool:
         """检查是否可以处理该消息"""
@@ -113,8 +138,9 @@ class AIAutoReplyHandler(MessageHandler):
             self.logger.error(f"消息预处理失败: {e}")
             return json.dumps([{"type": "text", "text": "消息处理失败"}], ensure_ascii=False)
 
+    @monitor_async_function("ai_message_handler", {"handler": "AIAutoReplyHandler"})
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
-        """处理消息并发送AI回复"""
+        """处理消息并发送AI回复 - 集成性能监控"""
         try:
             shop_id = context.kwargs.get('shop_id')
             user_id = context.kwargs.get('user_id')
@@ -124,7 +150,7 @@ class AIAutoReplyHandler(MessageHandler):
             if not all([shop_id, user_id, from_uid]):
                 self.logger.error("缺少必要的用户或店铺信息")
                 return False
-            
+
             try:
                 self.logger.info(f"'{username}'收到用户'{nickname}'消息: 消息类型：{context.type},消息内容：{context.content}")
                 reply = await self._get_ai_reply(context)
@@ -139,31 +165,48 @@ class AIAutoReplyHandler(MessageHandler):
             return False
 
     async def _get_ai_reply(self, context: Context):
-        """获取AI Bot回复"""
-        # 预处理消息内容
-        processed_content = self._preprocess_message(context)
-        
-        # 创建新的context对象，将预处理后的内容传递给bot
-        processed_context = Context(
-            type=ContextType.TEXT,  # 统一转换为TEXT类型
-            content=processed_content,
-            channel_type=context.channel_type,
-            kwargs=context.kwargs
-        )
-        
-        # 由于CozeBot的reply方法是同步的，这里直接调用
-        # 如果需要异步处理，可以使用asyncio.get_event_loop().run_in_executor
-        import asyncio
-        loop = asyncio.get_event_loop()
-        
-        # 在executor中运行同步的bot.reply方法
-        reply = await loop.run_in_executor(
-            None, 
-            self.bot.reply, 
-            processed_context
-        )
-        
-        return reply
+        """获取AI Bot回复 - 优化版本使用专用线程池"""
+        if not self.bot:
+            self.logger.warning("AI Bot实例不可用，无法获取回复")
+            from bridge.reply import Reply, ReplyType
+            return Reply(ReplyType.TEXT, "AI服务暂时不可用，请稍后再试")
+
+        try:
+            # 预处理消息内容
+            processed_content = self._preprocess_message(context)
+
+            # 创建新的context对象，将预处理后的内容传递给bot
+            processed_context = Context(
+                type=ContextType.TEXT,  # 统一转换为TEXT类型
+                content=processed_content,
+                channel_type=context.channel_type,
+                kwargs=context.kwargs
+            )
+
+            # 使用专用线程池运行同步的bot.reply方法
+            loop = asyncio.get_running_loop()
+
+            # 添加超时控制，防止长时间阻塞
+            reply = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self.executor,  # 使用专用的线程池
+                    self.bot.reply,
+                    processed_context
+                ),
+                timeout=30.0  # 30秒超时
+            )
+
+            return reply
+
+        except asyncio.TimeoutError:
+            self.logger.error("AI回复超时")
+            from bridge.reply import Reply, ReplyType
+            return Reply(ReplyType.TEXT, "AI回复超时，请稍后再试")
+
+        except Exception as e:
+            self.logger.error(f"获取AI回复失败: {e}", exc_info=True)
+            from bridge.reply import Reply, ReplyType
+            return Reply(ReplyType.TEXT, "AI服务暂时不可用，请稍后再试")
         
     async def _send_reply(self, reply, shop_id: str, user_id: str, from_uid: str) -> bool:
         """发送回复消息"""
@@ -386,25 +429,26 @@ class BusinessHoursHandler(MessageHandler):
 
 
 # 便捷函数：创建预配置的处理器
-def create_ai_handler(bot=None, enable_fallback: bool = True) -> AIAutoReplyHandler:
+def create_ai_handler(bot=None, enable_fallback: bool = True, max_workers: int = 5) -> AIAutoReplyHandler:
     """
     创建AI自动回复处理器
-    
+
     Args:
         bot: AI Bot实例，如果为None会自动创建CozeBot
         enable_fallback: 是否启用规则回复作为后备
+        max_workers: 线程池最大工作线程数
     """
-    return AIAutoReplyHandler(bot=bot, enable_fallback=enable_fallback)
+    return AIAutoReplyHandler(bot=bot, enable_fallback=enable_fallback, max_workers=max_workers)
 
 
-def create_coze_ai_handler() -> AIAutoReplyHandler:
+def create_coze_ai_handler(max_workers: int = 5) -> AIAutoReplyHandler:
     """创建基于CozeBot的AI回复处理器"""
     try:
         from Agent.bot_factory import create_bot
         bot = create_bot()
-        return AIAutoReplyHandler(bot=bot, enable_fallback=True)
+        return AIAutoReplyHandler(bot=bot, enable_fallback=True, max_workers=max_workers)
     except Exception as e:
-        return AIAutoReplyHandler(bot=None, enable_fallback=True)
+        return AIAutoReplyHandler(bot=None, enable_fallback=True, max_workers=max_workers)
 
 
 

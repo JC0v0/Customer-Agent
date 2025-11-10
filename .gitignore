@@ -62,3 +62,7 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
+CLAUDE.md
+.claude/
+.spec-workflow/
+.serena/

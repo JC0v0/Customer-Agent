@@ -10,16 +10,17 @@ from Channel.pinduoduo.pdd_message import PDDChatMessage
 from Channel.channel import Channel
 from Channel.pinduoduo.utils.API.get_token import GetToken
 from database import db_manager
+from utils.resource_manager import WebSocketResourceManager
 import websockets
 import json
 import asyncio
-from typing import Optional
+from typing import Optional, Set
 # 导入消息处理系统
 from Message import put_message
 from config import config
 
 class PDDChannel(Channel):
-    def __init__(self):
+    def __init__(self, max_concurrent_messages: int = 50):
         super().__init__()
         self.channel_name = "pinduoduo"
         self.logger = get_logger("PDDChannel")
@@ -27,6 +28,14 @@ class PDDChannel(Channel):
         self.ws = None
         self._stop_event = None  # 停止事件
         self.businessHours = config.get("businessHours")
+
+        # 性能优化：并发控制和任务管理
+        self.max_concurrent_messages = max_concurrent_messages
+        self.message_semaphore = asyncio.Semaphore(max_concurrent_messages)
+        self.processing_tasks: Set[asyncio.Task] = set()
+
+        # 资源管理
+        self.resource_manager = WebSocketResourceManager()
 
     async def start_account(self, shop_id: str, user_id: str, on_success: callable, on_failure: callable) -> None:
         """
@@ -117,25 +126,31 @@ class PDDChannel(Channel):
                 ping_timeout=20
             ) as websocket:
                 self.ws = websocket
+                # 注册WebSocket连接到资源管理器
+                self.resource_manager.register_websocket(
+                    websocket,
+                    f"PDD WebSocket ({shop_id}-{username})"
+                )
+
                 self.logger.debug(f"WebSocket连接已建立: {shop_id}-{username}")
-                
+
                 # 连接成功，调用成功回调
                 on_success()
-                
+
                 # 创建消息接收任务
                 message_task = asyncio.create_task(
                     self._message_loop(websocket, shop_id, user_id, username, queue_name)
                 )
-                
+
                 # 等待停止事件或消息任务完成
                 stop_task = asyncio.create_task(self._stop_event.wait())
-                
+
                 try:
                     done, pending = await asyncio.wait(
                         [message_task, stop_task],
                         return_when=asyncio.FIRST_COMPLETED
                     )
-                    
+
                     # 取消未完成的任务
                     for task in pending:
                         task.cancel()
@@ -143,12 +158,12 @@ class PDDChannel(Channel):
                             await task
                         except asyncio.CancelledError:
                             pass
-                    
+
                     if stop_task in done:
                         self.logger.debug(f"收到停止信号: {shop_id}-{username}")
                     else:
                         self.logger.debug(f"消息循环自然结束: {shop_id}-{username}")
-                        
+
                 except asyncio.CancelledError:
                     self.logger.debug(f"WebSocket任务被取消: {shop_id}-{username}")
                     message_task.cancel()
@@ -168,17 +183,56 @@ class PDDChannel(Channel):
             await self._cleanup_resources(f"pdd_{shop_id}")
     
     async def _message_loop(self, websocket, shop_id: str, user_id: str, username: str, queue_name: str):
-        """消息接收循环"""
+        """消息接收循环 - 优化版本支持并发处理"""
         try:
             async for message in websocket:
                 if self._stop_event and self._stop_event.is_set():
                     self.logger.info(f"停止事件已设置，退出消息循环: {shop_id}-{username}")
                     break
-                await self._process_websocket_message(message, shop_id, user_id, username, queue_name)
+
+                # 创建并发处理任务
+                task = asyncio.create_task(
+                    self._process_websocket_message_concurrent(
+                        message, shop_id, user_id, username, queue_name
+                    )
+                )
+
+                # 添加到任务跟踪集合
+                self.processing_tasks.add(task)
+                task.add_done_callback(self.processing_tasks.discard)
+
         except websockets.exceptions.ConnectionClosed:
             self.logger.warning(f"WebSocket连接在消息循环中关闭: {shop_id}-{username}")
         except Exception as e:
             self.logger.error(f"消息循环错误: {shop_id}-{username}, 错误: {str(e)}")
+
+    async def _process_websocket_message_concurrent(
+        self, message: str, shop_id: str, user_id: str, username: str, queue_name: str
+    ):
+        """并发处理WebSocket消息"""
+        async with self.message_semaphore:
+            try:
+                await self._process_websocket_message(message, shop_id, user_id, username, queue_name)
+            except Exception as e:
+                self.logger.error(f"并发处理消息失败: {e}")
+
+    async def cleanup_processing_tasks(self):
+        """清理所有处理任务"""
+        if not self.processing_tasks:
+            return
+
+        self.logger.info(f"清理 {len(self.processing_tasks)} 个处理任务")
+        for task in self.processing_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    self.logger.error(f"清理任务失败: {e}")
+
+        self.processing_tasks.clear()
     
     def request_stop(self):
         """请求停止WebSocket连接"""
@@ -353,18 +407,23 @@ class PDDChannel(Channel):
     
     async def _cleanup_resources(self, queue_name: str):
         """
-        清理资源
+        清理资源 - 优化版本支持完整资源管理
         """
         try:
+            # 清理处理任务
+            await self.cleanup_processing_tasks()
+
+            # 清理WebSocket资源
+            await self.resource_manager.cleanup_all()
+
+            # 停止消息消费者
             from Message.message_consumer import message_consumer_manager
-            
-            # 停止消费者
             await message_consumer_manager.stop_consumer(queue_name)
             self.logger.debug(f"已停止消息消费者: {queue_name}")
-            
-            # 清理WebSocket连接
+
+            # 清理WebSocket连接引用
             self.ws = None
-            
+
         except Exception as e:
             self.logger.error(f"清理资源失败: {e}")  
     
