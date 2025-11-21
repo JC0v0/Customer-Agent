@@ -24,7 +24,7 @@ MANIFEST
 
 # 测试文件夹
 test/
-
+/user_data/
 # 配置文件（可能包含敏感信息）
 config.json
 cookies.json
