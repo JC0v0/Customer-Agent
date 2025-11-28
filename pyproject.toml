@@ -15,4 +15,5 @@ dependencies = [
     "flask-cors>=5.0.1",
     "pyqt6>=6.9.0",
     "pyqt6-fluent-widgets[full]>=1.8.1",
+    "openai>=2.8.1",
 ]

@@ -15,7 +15,10 @@ config_base={
     "businessHours": {
         "start": "08:00",
         "end": "23:00"
-    }
+    },
+    "openai_api_base": "https://api.openai.com/v1",
+    "openai_api_key": "",
+    "openai_model": "gpt-3.5-turbo"
 }
 
 class Config:
