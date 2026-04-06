@@ -23,8 +23,8 @@
 
 ### 💬 智能消息处理
 - 实时消息监控与自动回复
-- 集成AI (Coze API) 生成智能回复内容
-- 支持自定义回复模板和关键词识别
+- 集成 AI (Agno) 生成智能回复内容
+- 支持知识库检索和自定义回复模板
 
 <div align="center">
   <img src="docs/自动回复.png" alt="自动回复界面" width="500">
@@ -91,9 +91,9 @@ python app.py
    - 配置需要人工转接的关键词
    - 设置自动回复的话术模板
 
-3. **配置Coze API**
-   - 在设置界面配置Coze API
-   - 设置Coze API
+3. **配置AI模型**
+   - 在设置界面配置 AI 模型
+   - 支持 OpenAI/DeepSeek/Gemini/Kimi/Claude 等
 
 4. **启动系统**
    - 在账号管理界面启动系统
@@ -105,54 +105,68 @@ python app.py
 
 ## 🛠️ 技术架构
 
-- **前端界面**: qfluentwidgets
-- **后端逻辑**: Python
-- **AI集成**: Coze API
-- **数据存储**: SQLite + JSON
+- **前端界面**: PyQt6 + PyQt-Fluent-Widgets
+- **后端逻辑**: Python asyncio
+- **AI集成**: Agno + OpenAI兼容API (支持 DeepSeek/Gemini/Kimi/Claude)
+- **数据存储**: SQLAlchemy + SQLite + LanceDB (向量数据库)
 - **浏览器自动化**: Playwright
+- **日志系统**: Loguru
+- **包管理**: UV
 
 ## 📁 项目结构
 
 ```
 Customer-Agent/
 ├── Agent/              # AI智能代理模块
-│   ├── bot_factory.py      # 机器人工厂
 │   ├── bot.py             # 机器人基类
-│   └── CozeAgent/         # Coze AI代理
-│       ├── bot.py
-│       ├── conversation_manager.py
-│       └── user_session.py
+│   └── CustomerAgent/     # 客服代理
+│       ├── agent.py           # 主要代理逻辑
+│       ├── agent_knowledge.py # 知识库集成
+│       ├── tools/             # 代理工具集
+│       └── readers/           # 文档读取器
 ├── Channel/            # 渠道接口模块
 │   ├── channel.py         # 渠道基类
-│   └── pinduoduo/        # 拼多多渠道
-│       ├── pdd_chnnel.py
-│       ├── pdd_login.py
-│       ├── pdd_message.py
-│       └── utils/        # 拼多多API工具
+│   └── pinduoduo/      # 拼多多渠道
+│       ├── pdd_chnnel.py    # 渠道主类
+│       ├── pdd_login.py     # 登录处理
+│       └── utils/        # API工具
 ├── Message/            # 消息处理模块
-│   ├── message_consumer.py   # 消息消费者
-│   ├── message_handler.py    # 消息处理器
-│   ├── message_queue.py      # 消息队列
-│   └── message.py           # 消息基类
+│   ├── core/              # 核心组件
+│   │   ├── consumer.py    # 消息消费者
+│   │   ├── handlers.py    # 处理器管理
+│   │   └── queue.py       # 消息队列
+│   ├── handlers/          # 具体处理器
+│   │   ├── ai_handler.py      # AI处理器
+│   │   ├── keyword_handler.py # 关键词处理器
+│   │   └── preprocessor.py    # 预处理器
+│   └── models/           # 数据模型
+├── core/               # 核心服务模块
+│   ├── di_container.py    # 依赖注入容器
+│   ├── cache.py           # 缓存服务
+│   ├── connection_status.py # 连接状态管理
+│   └── service_providers.py # 服务提供者
 ├── bridge/             # 桥接模块
-│   ├── bridge.py          # 桥接器
 │   ├── context.py         # 上下文管理
-│   └── reply.py           # 回复处理
+│   └── reply.py          # 回复处理
 ├── database/           # 数据库模块
 │   ├── db_manager.py      # 数据库管理器
-│   └── models.py          # 数据模型
+│   ├── models.py          # 数据模型
+│   └── connection_pool.py # 连接池管理
 ├── ui/                 # 用户界面模块
 │   ├── main_ui.py         # 主界面
 │   ├── auto_reply_ui.py   # 自动回复界面
+│   ├── Knowledge_ui.py    # 知识库界面
 │   ├── keyword_ui.py      # 关键词管理界面
 │   ├── log_ui.py          # 日志界面
 │   ├── setting_ui.py      # 设置界面
 │   └── user_ui.py         # 用户管理界面
 ├── utils/              # 工具函数
-│   └── logger.py          # 日志工具
+│   ├── logger_loguru.py   # Loguru日志系统
+│   ├── logger_config.py   # 日志配置
+│   ├── resource_manager.py # 资源管理
+│   └── path_utils.py      # 路径工具
+├── scripts/            # 构建脚本
 ├── docs/               # 文档和截图
-├── icon/               # 图标资源
-├── logs/               # 日志文件
 ├── app.py              # 应用程序入口
 ├── config.py           # 配置管理
 ├── pyproject.toml      # 项目配置
