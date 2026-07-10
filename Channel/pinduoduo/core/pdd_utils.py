@@ -1,6 +1,8 @@
 # 全局便捷函数模块
 from typing import Dict, List
 
+from core.connection_status import ConnectionStatusManager
+
 
 def get_pdd_connection_status() -> List:
     """获取所有拼多多连接状态 - 全局便捷函数"""

@@ -15,10 +15,15 @@ logs/
 dist
 build
 .venv
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
 user_data/
 *.db
-*.db
 config.json
+config.tmp
 temp/
 .claude/
 

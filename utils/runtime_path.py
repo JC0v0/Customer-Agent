@@ -213,7 +213,7 @@ def adjust_config_for_runtime(config: dict) -> dict:
             # 如果是相对路径，转换为绝对路径
             path = Path(adjusted_config[key])
             if not path.is_absolute():
-                adjusted_config[key] = str(get_temp_dir() / path.name)
+                adjusted_config[key] = str(get_temp_path(path.name))
 
     return adjusted_config
 

@@ -32,6 +32,11 @@ dependencies = [
 build = [
     "pyinstaller>=6.0.0",
 ]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.8.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -39,3 +44,40 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["Agent", "Channel", "Message", "bridge", "core", "database", "ui", "utils", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [
+    ".browsers",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "build",
+    "dist",
+    "logs",
+    "temp",
+    "user_data",
+]
+
+[tool.ruff.lint]
+# 先启用高价值、低误伤的基础检查，避免一次性要求改动大量既有业务代码。
+# 后续可逐步扩展到 E/F/I/UP/B 等更严格规则。
+select = ["E9", "F63", "F7", "F82"]
+ignore = [
+    "E501",  # 当前项目存在较多中文长字符串，暂不强制行宽。
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
