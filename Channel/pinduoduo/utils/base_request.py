@@ -192,12 +192,16 @@ class BaseRequest:
         Returns:
             是否重新获取cookies成功
         """
-        from Channel.pinduoduo.cookie_utils import relogin_guard
+        from Channel.pinduoduo.cookie_utils import relogin_guard, notify_relogin_failure
         from Channel.pinduoduo.cookie_cache import cookie_cache
 
         # 尝试获取重登权（防止并发重复重登）
         if not relogin_guard.try_acquire(self.channel_name, self.shop_id, self.user_id):
-            self.logger.info(f"重登已在其他线程进行中或冷却期内: {self.account_name}，从缓存读取最新cookie")
+            # 区分「冷却期」（刚重登失败过）与「锁被占用」（另一线程正在重登）
+            if relogin_guard.is_in_cooldown(self.channel_name, self.shop_id, self.user_id):
+                self.logger.info(f"重登处于冷却期内，跳过本次重登: {self.account_name}")
+                return False
+            self.logger.info(f"重登已在其他线程进行中: {self.account_name}，从缓存读取最新cookie")
             cached = cookie_cache.get(self.channel_name, self.shop_id, self.user_id)
             if cached:
                 self.cookies = cached
@@ -249,6 +253,10 @@ class BaseRequest:
             if not password:
                 self.logger.error(f"账号 {self.account_name} 缺少密码，无法进行完整重新登录")
                 relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
+                notify_relogin_failure(
+                    self.channel_name, self.shop_id, self.user_id, self.account_name,
+                    "登录状态已失效且缺少密码，无法自动重登",
+                )
                 return False
 
             self.logger.info(f"回退到完整重新登录模式（headless，账号 {self.account_name}）...")
@@ -276,10 +284,18 @@ class BaseRequest:
                     else:
                         self.logger.error(f"账号 {self.account_name} 完整重新登录失败：未获取到有效cookies")
                         relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
+                        notify_relogin_failure(
+                            self.channel_name, self.shop_id, self.user_id, self.account_name,
+                            "完整重新登录未获取到有效 cookies",
+                        )
                         return False
                 else:
                     self.logger.error(f"账号 {self.account_name} 完整重新登录失败")
                     relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
+                    notify_relogin_failure(
+                        self.channel_name, self.shop_id, self.user_id, self.account_name,
+                        "完整重新登录失败",
+                    )
                     return False
 
             except Exception as login_error:
@@ -288,6 +304,10 @@ class BaseRequest:
                     f"error_type={type(login_error).__name__}"
                 )
                 relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
+                notify_relogin_failure(
+                    self.channel_name, self.shop_id, self.user_id, self.account_name,
+                    f"完整重新登录异常（{type(login_error).__name__}）",
+                )
                 return False
 
         except Exception as e:
@@ -296,6 +316,10 @@ class BaseRequest:
                 f"error_type={type(e).__name__}"
             )
             relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
+            notify_relogin_failure(
+                self.channel_name, self.shop_id, self.user_id, self.account_name,
+                f"重新获取 cookies 过程异常（{type(e).__name__}）",
+            )
             return False
     
     def _should_retry(self, response: requests.Response = None, exception: Exception = None) -> bool:

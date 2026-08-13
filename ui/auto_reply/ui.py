@@ -19,6 +19,8 @@ class AutoReplyUI(QFrame):
         self.logger = get_logger()
         self.accounts_data = []
         self._loaded_once = False
+        # 已提示过的重登失败（shop_id_user_id + last_error），避免每 10 秒重复弹窗
+        self._notified_relogin_errors = set()
         self.setupUI()
         QTimer.singleShot(300, self._maybeLoadOnShow)
 
@@ -235,6 +237,54 @@ class AutoReplyUI(QFrame):
 
         except Exception as e:
             self.logger.error(f"同步自动回复状态失败: error_type={type(e).__name__}")
+
+        self._check_relogin_failures()
+
+    def _check_relogin_failures(self):
+        """检查运行中账号的 Cookie 重登失败状态，提示用户手动重登。
+
+        由 10 秒定时器调用；同一账号的同一错误只提示一次（去重）。
+        """
+        try:
+            from core.di_container import container
+            from core.connection_status import ConnectionStatusManager, ConnectionState
+
+            status_manager = container.get(ConnectionStatusManager)
+            pending_messages = []
+
+            for status in status_manager.get_all_status():
+                if status.state != ConnectionState.ERROR:
+                    continue
+                if not status.last_error or "重新登录失败" not in status.last_error:
+                    continue
+
+                account_key = "_".join([
+                    "pinduoduo",
+                    str(status.shop_id),
+                    str(status.user_id),
+                ])
+                if account_key not in auto_reply_manager.running_accounts:
+                    continue
+
+                notify_key = f"{status.shop_id}_{status.user_id}:{status.last_error}"
+                if notify_key in self._notified_relogin_errors:
+                    continue
+                self._notified_relogin_errors.add(notify_key)
+                pending_messages.append(f"「{status.username}」：{status.last_error}")
+
+            if pending_messages:
+                detail = "\n".join(pending_messages)
+                self.logger.error(f"检测到 Cookie 重登失败:\n{detail}")
+                QMessageBox.warning(
+                    self,
+                    "Cookie 登录失效",
+                    "以下账号的 Cookie 已过期，且自动重新登录失败：\n\n"
+                    f"{detail}\n\n"
+                    "请到「账号管理」页手动重新登录这些账号。",
+                )
+
+        except Exception as e:
+            self.logger.error(f"检查重登失败状态失败: error_type={type(e).__name__}")
 
     def reloadAccounts(self):
         """重新加载账号"""

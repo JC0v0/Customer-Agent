@@ -391,6 +391,30 @@ class PDDLogin():
             text = text[:2000] + "...(截断)"
         self.logger.warning(f"{headline}\n浏览器 stderr:\n{text}")
 
+    async def _try_click(self, page, selectors, timeout: float = 5000.0) -> bool:
+        """逐个尝试点击候选选择器，任一成功返回 True，全部失败返回 False。"""
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                await locator.wait_for(state="visible", timeout=timeout)
+                await locator.click(timeout=timeout)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _try_fill(self, page, selectors, value, timeout: float = 5000.0) -> bool:
+        """逐个尝试向候选输入框填充内容，任一成功返回 True，全部失败返回 False。"""
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                await locator.wait_for(state="visible", timeout=timeout)
+                await locator.fill(value, timeout=timeout)
+                return True
+            except Exception:
+                continue
+        return False
+
     async def login(self, headless=False):
         """使用账号密码登录
 
@@ -416,20 +440,50 @@ class PDDLogin():
             # 访问登录页面
             await page.goto(self.base_url)
             
-            # 点击账号密码登录
-            await page.click("div.Common_item__3diIn:has-text('账号登录')")
-            
-            # 等待页面加载
-            await page.wait_for_selector("input[type='text']")
-            
+            # 切换到「账号登录」标签（页面默认可能停留在扫码登录）。
+            # 拼多多前端类名带 hash（如 Common_item__3diIn），易随版本变化，
+            # 这里用多候选选择器逐个尝试，任一命中即可。
+            await self._try_click(page, [
+                "div.Common_item__3diIn:has-text('账号登录')",
+                "text=账号登录",
+                "a:has-text('账号登录')",
+                "span:has-text('账号登录')",
+                "div:has-text('账号登录')",
+            ])
+
+            # 等待账号输入框出现（多候选，任一出现即继续）
+            try:
+                await page.wait_for_selector(
+                    "input[type='text'], input[placeholder*='账号'], "
+                    "input[placeholder*='用户名'], input[placeholder*='店铺']",
+                    timeout=15000,
+                )
+            except PlaywrightTimeoutError:
+                self.logger.warning("等待账号输入框超时，尝试直接填充")
+
             # 输入店铺名
-            await page.fill("input[type='text']", self.name)
-            
+            if not await self._try_fill(page, [
+                "input[type='text']",
+                "input[placeholder*='账号']",
+                "input[placeholder*='用户名']",
+                "input[placeholder*='店铺']",
+            ], self.name):
+                raise RuntimeError("未找到账号输入框")
+
             # 输入密码
-            await page.fill("input[type='password']", self.password)
-            
-            # 点击登录按钮
-            await page.click("button:has-text('登录')")
+            if not await self._try_fill(page, [
+                "input[type='password']",
+                "input[placeholder*='密码']",
+            ], self.password):
+                raise RuntimeError("未找到密码输入框")
+
+            # 点击登录按钮（多候选，兼容按钮文案空格/样式变化）
+            if not await self._try_click(page, [
+                "button:has-text('登录')",
+                "button:has-text('登 录')",
+                "button:has-text('立即登录')",
+            ]):
+                raise RuntimeError("未找到登录按钮")
             
             # 等待页面 title等于 拼多多 商家后台，首页或者订单查询
             await page.wait_for_function("() => document.title === '拼多多 商家后台' || document.title === '首页' || document.title === '订单查询'", timeout=30000)

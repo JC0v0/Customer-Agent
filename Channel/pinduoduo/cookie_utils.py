@@ -69,9 +69,13 @@ def check_cookies_valid(
     payload = {'version': '3'}
 
     try:
+        # 与 GetToken.get_token 保持一致：用 data= 表单编码发送 version=3。
+        # （实测 GetToken 走 BaseRequest.post 的 data=dict + 显式 Content-Type
+        #  header，实际 body 为 "version=3"；此前此处用 json= 会发送
+        #  {"version": "3"}，导致验证请求与真实请求语义不一致，可能漏检过期。）
         response = requests.post(
             url,
-            json=payload,
+            data=payload,
             headers=_VALIDATION_HEADERS,
             cookies=cookies,
             timeout=timeout,
@@ -139,6 +143,13 @@ class ReloginGuard:
 
         return acct_lock.acquire(blocking=False)
 
+    def is_in_cooldown(self, channel_name: str, shop_id: str, user_id: str) -> bool:
+        """检查指定账户当前是否处于重登冷却期内。"""
+        key = self._make_key(channel_name, shop_id, user_id)
+        with self._lock:
+            last_time = self._last_relogin.get(key, 0)
+            return (time.time() - last_time) < self._cooldown
+
     def release(self, channel_name: str, shop_id: str, user_id: str, success: bool = False):
         """释放锁，成功时记录时间戳用于冷却期"""
         key = self._make_key(channel_name, shop_id, user_id)
@@ -159,6 +170,32 @@ class ReloginGuard:
 
 # 模块级单例
 relogin_guard = ReloginGuard(cooldown_seconds=60.0)
+
+
+def notify_relogin_failure(
+    channel_name: str,
+    shop_id: str,
+    user_id: str,
+    username: str,
+    reason: str,
+) -> None:
+    """重登失败后更新连接状态为 ERROR，提示用户在账号管理页手动重登。
+
+    仅影响 UI 状态展示；任何异常都被吞掉，不阻断重登流程本身。
+    """
+    try:
+        from core.di_container import container
+        from core.connection_status import ConnectionStatusManager, ConnectionState
+        status_manager = container.get(ConnectionStatusManager)
+        status_manager.update_status(
+            shop_id,
+            user_id,
+            username or user_id,
+            ConnectionState.ERROR,
+            f"Cookie 重新登录失败：{reason}，请在账号管理页手动重新登录",
+        )
+    except Exception:
+        pass
 
 
 def perform_relogin(
@@ -186,7 +223,12 @@ def perform_relogin(
         是否成功获取新 cookie
     """
     if not relogin_guard.try_acquire(channel_name, shop_id, user_id):
-        logger.info(f"重登已在其他线程进行中或冷却期内: {username}")
+        # 区分「冷却期」（刚重登失败过）与「锁被占用」（另一线程正在重登）：
+        # 前者应如实返回失败，避免调用方把过期 cookie 误判为重登成功。
+        if relogin_guard.is_in_cooldown(channel_name, shop_id, user_id):
+            logger.info(f"重登处于冷却期内，跳过本次重登: {username}")
+            return False
+        logger.info(f"重登已在其他线程进行中: {username}")
         from Channel.pinduoduo.cookie_cache import cookie_cache
         return cookie_cache.get(channel_name, shop_id, user_id) is not None
 
@@ -226,6 +268,10 @@ def perform_relogin(
         if not password:
             logger.error(f"缺少密码，无法完整重新登录: {username}")
             relogin_guard.release(channel_name, shop_id, user_id, success=False)
+            notify_relogin_failure(
+                channel_name, shop_id, user_id, username,
+                "登录状态已失效且缺少密码，无法自动重登",
+            )
             return False
 
         logger.info(f"回退到完整重新登录 (headless={headless_fallback}): {username}")
@@ -259,6 +305,10 @@ def perform_relogin(
 
         logger.error(f"重新登录失败: {username}")
         relogin_guard.release(channel_name, shop_id, user_id, success=False)
+        notify_relogin_failure(
+            channel_name, shop_id, user_id, username,
+            "Cookie 刷新与完整登录均失败",
+        )
         return False
 
     except Exception as e:
@@ -266,6 +316,10 @@ def perform_relogin(
             f"重登流程异常: {username}, error_type={type(e).__name__}"
         )
         relogin_guard.release(channel_name, shop_id, user_id, success=False)
+        notify_relogin_failure(
+            channel_name, shop_id, user_id, username,
+            f"重登流程异常（{type(e).__name__}）",
+        )
         return False
 
 

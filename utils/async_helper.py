@@ -82,9 +82,19 @@ def run_async_in_thread(coro: Coroutine, timeout: Optional[float] = None) -> Any
 
     Raises:
         TimeoutError: 如果超时
+
+    Notes:
+        超时会立即返回 TimeoutError，不会像旧实现那样被 ThreadPoolExecutor
+        的 with 退出（shutdown(wait=True)）阻塞等待后台线程真正结束。
+        后台协程仍会在其线程中继续运行直至自行结束。
     """
     import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
         future = executor.submit(asyncio.run, coro)
         return future.result(timeout=timeout)
+    finally:
+        # 关键：wait=False，避免超时后仍阻塞等待后台线程；cancel_futures=False
+        # 让已在运行的协程继续收尾，不强制中断（asyncio.run 无法被安全强杀）。
+        executor.shutdown(wait=False, cancel_futures=False)
