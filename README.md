@@ -138,7 +138,7 @@ Agent-Customer/
 ├── service/                # 服务层（账号/关键词服务薄封装）
 ├── ui/                     # PyQt6 用户界面
 ├── utils/                  # 工具模块（日志、路径等）
-├── scripts/                # 构建脚本
+├── scripts/                # 构建与抓包脚本
 └── app.py                  # 应用入口
 ```
 

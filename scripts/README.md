@@ -10,6 +10,8 @@ scripts/
 ├── build_exe.py          # 完整打包脚本（功能丰富）
 ├── build_win_exe.py      # 简化打包脚本（快速构建）
 ├── install_playwright.py # Playwright 浏览器安装脚本
+├── capture_pdd_ws.py     # 拼多多客服 WebSocket 抓包（CDP 监听）
+├── decode_pdd_ws.py      # 抓包离线解码，输出可读 JSON
 ├── version_info.txt      # Windows 可执行文件版本信息
 └── README.md             # 本使用说明文档
 ```
@@ -170,6 +172,48 @@ Windows 可执行文件的版本信息配置文件，用于 PyInstaller 打包�
 StringStruct(u'FileVersion', u'0.1.0.0'),  # 修改版本号
 StringStruct(u'CompanyName', u'你的公司名'),  # 修改公司名
 ```
+
+---
+
+### 5. capture_pdd_ws.py - 拼多多 WebSocket 抓包
+
+**功能描述：**
+复用项目已有的 Playwright 持久化登录态（`user_data/`），在真实浏览器会话里通过
+CDP 监听 `wss://*-ws.pinduoduo.com/` 的全部帧，落盘为 JSONL。
+
+**使用示例：**
+```bash
+# 列出数据库里的拼多多账号
+python scripts/capture_pdd_ws.py --list
+
+# 抓 10 分钟（窗口打开后如会话过期，手动登录一次即可）
+python scripts/capture_pdd_ws.py --account <shop_id>:<user_id> --duration 600
+```
+
+脚本会先等 WebSocket 真正建立再开始计时，避免把抓包时长浪费在人工登录上。
+抓包文件含买家昵称、商品信息等业务数据（`access_token` 会自动脱敏），分享前请自查。
+
+### 6. decode_pdd_ws.py - 抓包离线解码
+
+**功能描述：**
+把抓包 JSONL 解码成可读格式：拆开 16 字节帧头 + protobuf 体，并解开
+`titan.notifyDataLite` 的通知负载（大块 gzip / 小块明文两种变体），
+还原内嵌 JSON，同时关联「通知 ↔ ACK」。
+
+**使用示例：**
+```bash
+python scripts/decode_pdd_ws.py temp/pdd_ws_20260920_163006.jsonl
+```
+
+输出到 `temp/decoded/`：
+
+- `<名字>.decoded.json` —— 逐帧完整解码（含帧头、方法名、序号）
+- `<名字>.messages.json` —— 只含聊天消息，按时间排序
+
+解码器不联网、不依赖 DI 容器，纯离线分析。
+
+抓包得到的完整接口清单（WS 命令、HTTP 端点、错误码、消息类型）整理在
+`docs/reference/pinduoduo-chat-protocol.md`。
 
 ---
 
