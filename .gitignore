@@ -60,3 +60,6 @@ CLAUDE.md
 .github/*
 !.github/workflows/
 !.github/workflows/**
+
+# 本地文档（设计说明、协议参考等，不纳入版本库）
+docs/
