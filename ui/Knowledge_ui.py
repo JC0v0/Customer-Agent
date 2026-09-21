@@ -11,6 +11,7 @@
 from __future__ import annotations
 import asyncio
 import os
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional, List, Dict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -29,6 +30,7 @@ from core.di_container import container
 from database.knowledge_service import KnowledgeService
 from database.product_sync import ProductSyncService, SyncProgress
 from database.models import ProductKnowledge, CustomerServiceKnowledge, Shop
+from service import knowledge_io
 from utils.logger_loguru import get_logger
 
 if TYPE_CHECKING:
@@ -462,8 +464,16 @@ class KnowledgeUI(QWidget):
         self.batch_import_btn = PushButton("批量导入")
         self.batch_import_btn.clicked.connect(self._on_batch_import_clicked)
 
+        self.export_cs_btn = PushButton("导出")
+        self.export_cs_btn.clicked.connect(self._on_export_cs_clicked)
+
+        self.template_cs_btn = PushButton("下载模板")
+        self.template_cs_btn.clicked.connect(self._on_download_template_clicked)
+
         toolbar.addWidget(self.add_cs_btn)
         toolbar.addWidget(self.batch_import_btn)
+        toolbar.addWidget(self.export_cs_btn)
+        toolbar.addWidget(self.template_cs_btn)
         toolbar.addStretch()
         toolbar.addWidget(self.tag_label)
         toolbar.addWidget(self.tag_combo)
@@ -863,49 +873,90 @@ class KnowledgeUI(QWidget):
             return
 
         try:
-            rows, parse_skipped = self._parse_excel(filepath)
+            parsed = knowledge_io.parse_workbook(filepath)
         except Exception as e:
+            logger.error(f"客服知识导入失败: error_type={type(e).__name__}")
             self._show_message("error", f"文件读取失败: {e}")
             return
 
-        success, import_skipped = self.knowledge_service.batch_import_customer_service(
-            self.current_shop_id, rows
+        success, duplicated = self.knowledge_service.batch_import_customer_service(
+            self.current_shop_id, parsed.rows
         )
-        total_skipped = parse_skipped + import_skipped
-        self._show_message("success", f"导入完成：成功 {success} 条，跳过 {total_skipped} 条")
         self._refresh_cs_table()
+        self._report_import_result(parsed, success, duplicated)
 
-    def _parse_excel(self, filepath: str) -> tuple[list, int]:
-        """解析 Excel 文件，返回 (有效行列表, 跳过行数)
+    def _report_import_result(self, parsed, success: int, duplicated: int):
+        """交代清楚每一条的去向：只给总数的话用户无从修起。"""
+        summary = [f"成功导入 {success} 条"]
+        if duplicated:
+            summary.append(f"重复跳过 {duplicated} 条")
+        if parsed.skipped_count:
+            summary.append(f"格式问题跳过 {parsed.skipped_count} 条")
 
-        列顺序：0=一级分类, 1=二级分类, 2=话术标题, 3=话术内容
-        """
-        import pandas as pd
+        details = []
+        if not parsed.header_recognized:
+            details.append(
+                "未识别到已知表头，已按默认列顺序（一级分类 / 二级分类 / 话术标题 / 话术内容）解析。\n"
+                "建议使用「下载模板」提供的表头。\n"
+            )
+        if parsed.skipped_count:
+            details.append("以下行未导入：\n" + parsed.describe_skipped())
 
-        df = pd.read_excel(filepath, header=0, dtype=str)
-        df = df.fillna("")
+        box = QMessageBox(self)
+        box.setWindowTitle("导入结果")
+        box.setText("，".join(summary))
+        box.setIcon(
+            QMessageBox.Icon.Warning
+            if (parsed.skipped_count or not parsed.header_recognized)
+            else QMessageBox.Icon.Information
+        )
+        if details:
+            box.setDetailedText("\n".join(details))
+        box.exec()
 
-        rows = []
-        skipped = 0
-        for _, row in df.iterrows():
-            values = row.tolist()
-            # 补齐不足4列的情况
-            while len(values) < 4:
-                values.append("")
+    def _on_export_cs_clicked(self):
+        """导出当前店铺的客服知识，列与模板一致，改完可直接导回。"""
+        if self.current_shop_id is None:
+            self._show_message("warning", "请先选择店铺")
+            return
 
-            cat1 = str(values[0]).strip()
-            cat2 = str(values[1]).strip()
-            title = str(values[2]).strip()
-            content = str(values[3]).strip()
+        items = self.knowledge_service.list_customer_service_with_disabled(
+            self.current_shop_id
+        )
+        if not items:
+            self._show_message("warning", "当前店铺没有客服知识可导出")
+            return
 
-            if not cat1 or not content:
-                skipped += 1
-                continue
+        default_name = f"客服知识_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "导出客服知识", default_name, "Excel 文件 (*.xlsx)"
+        )
+        if not filepath:
+            return
 
-            tags = f"{cat1},{cat2}" if cat2 else cat1
-            rows.append({"title": title, "content": content, "tags": tags})
+        try:
+            count = knowledge_io.export_workbook(filepath, items)
+        except Exception as e:
+            logger.error(f"客服知识导出失败: error_type={type(e).__name__}")
+            self._show_message("error", f"导出失败: {e}")
+            return
+        self._show_message("success", f"已导出 {count} 条客服知识到: {filepath}")
 
-        return rows, skipped
+    def _on_download_template_clicked(self):
+        """生成导入模板：含表头、示例行与填写说明。"""
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "保存导入模板", "客服知识导入模板.xlsx", "Excel 文件 (*.xlsx)"
+        )
+        if not filepath:
+            return
+
+        try:
+            knowledge_io.write_template(filepath)
+        except Exception as e:
+            logger.error(f"客服知识模板生成失败: error_type={type(e).__name__}")
+            self._show_message("error", f"模板生成失败: {e}")
+            return
+        self._show_message("success", f"模板已保存到: {filepath}")
 
     def _on_edit_cs(self, row: int):
         """编辑客服知识"""

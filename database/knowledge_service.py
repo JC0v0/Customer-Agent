@@ -315,7 +315,7 @@ class KnowledgeService:
 
         Args:
             shop_id: 店铺数据库ID
-            rows: 待导入行列表，每项含 title, content, tags
+            rows: 待导入行列表，每项含 title, content, tags，可选 enabled
 
         Returns:
             (success_count, skipped_count)
@@ -324,9 +324,13 @@ class KnowledgeService:
         skipped = 0
         with self.get_session() as session:
             for row in rows:
-                title = row.get("title", "")
-                content = row.get("content", "")
+                title = (row.get("title") or "").strip()
+                content = (row.get("content") or "").strip()
                 tags = row.get("tags")
+                # 标题与内容是非空列；解析层已校验，这里兜底防止其他调用方写坏数据。
+                if not title or not content:
+                    skipped += 1
+                    continue
 
                 # 重复检测：同店铺下标题+内容完全相同
                 stmt = select(CustomerServiceKnowledge).where(
@@ -345,7 +349,8 @@ class KnowledgeService:
                     title=title,
                     content=content,
                     tags=tags,
-                    enabled=True,
+                    # 导入文件可以显式停用某条话术；缺省仍按启用处理。
+                    enabled=bool(row.get("enabled", True)),
                 )
                 session.add(cs)
                 success += 1
