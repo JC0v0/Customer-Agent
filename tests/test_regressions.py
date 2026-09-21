@@ -429,5 +429,117 @@ class CompatibilityRegressionTests(unittest.TestCase):
                 safe_image_fetch.fetch_image("https://example.com/logo.png")
 
 
+class StopAccountTaskCleanupTest(unittest.IsolatedAsyncioTestCase):
+    """停止账号时，任务字典可能已被并发清理清空。
+
+    stop_account 取消连接任务后会 await 它；被取消的连接任务在自己的
+    CancelledError 分支里调用 _cleanup_resources，而它会执行
+    _reconnect_tasks.clear()。await 返回后若仍用 del 取键，就会抛 KeyError，
+    使后面的状态更新与资源释放全部被跳过（表现为停止后状态仍显示已连接）。
+    """
+
+    SHOP = "591119888"
+    USER = "149439461"
+
+    def make_channel(self):
+        from Channel.pinduoduo.pdd_channel import PDDChannel
+        from Message.core.queue import QueueManager
+        from Message.core.consumer import MessageConsumerManager
+        from core.connection_status import ConnectionStatusManager
+        from utils.logger_loguru import get_logger
+
+        class FakeResourceManager:
+            def __init__(self):
+                self.cleaned = 0
+
+            async def cleanup_all(self):
+                self.cleaned += 1
+
+        channel = object.__new__(PDDChannel)
+        channel.channel_name = "pinduoduo"
+        channel.logger = get_logger("PDDChannel")
+        channel._stop_event = asyncio.Event()
+        channel._reconnect_tasks = {}
+        channel._heartbeat_tasks = {}
+        channel._health_tasks = {}
+        channel.processing_tasks = set()
+        channel.message_semaphore = asyncio.Semaphore(5)
+        channel.ws = None
+        channel._account_agent = None
+        channel._account_key = None
+        channel.resource_manager = FakeResourceManager()
+        channel.queue_manager = QueueManager()
+        channel.consumer_manager = MessageConsumerManager(channel.queue_manager)
+        channel.status_manager = ConnectionStatusManager()
+        return channel
+
+    async def test_stop_survives_concurrent_task_registry_cleanup(self):
+        from Channel.pinduoduo.core import pdd_lifecycle as lifecycle_module
+        from core.connection_status import ConnectionState
+
+        channel = self.make_channel()
+        key = f"{self.SHOP}_{self.USER}"
+        queue_name = make_queue_name(ChannelType.PINDUODUO, self.SHOP, self.USER)
+        started = asyncio.Event()
+
+        async def connection_task():
+            """模拟 init()：被取消时走清理分支。"""
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await channel._cleanup_resources(queue_name)
+                raise
+
+        task = asyncio.create_task(connection_task())
+        channel._reconnect_tasks[key] = task
+        await started.wait()
+        channel.status_manager.update_status(
+            self.SHOP, self.USER, "葵花卫生景诚", ConnectionState.CONNECTED
+        )
+
+        with mock.patch.object(lifecycle_module, "db_manager") as db:
+            db.get_account.return_value = {"username": "葵花卫生景诚"}
+            await channel.stop_account(self.SHOP, self.USER)
+
+        status = channel.status_manager.get_status(self.SHOP, self.USER)
+        self.assertEqual(status.state, ConnectionState.DISCONNECTED)
+        self.assertEqual(channel._reconnect_tasks, {})
+        self.assertTrue(task.done())
+
+    async def test_cleanup_does_not_cancel_the_current_task(self):
+        """清理重连任务时不能把正在执行清理的那个任务也取消掉。
+
+        用 cancelling() 而不是 cancelled()：取消请求是延迟投递的，若清理者
+        取消了自己，在下一个 await 点才会收到 CancelledError，此时用
+        cancelled() 检查会误判为「没被取消」。
+        """
+        channel = self.make_channel()
+        key = f"{self.SHOP}_{self.USER}"
+        channel._reconnect_tasks[key] = asyncio.current_task()
+
+        await channel._cleanup_reconnect_tasks()
+
+        self.assertEqual(asyncio.current_task().cancelling(), 0)
+        self.assertEqual(channel._reconnect_tasks, {})
+
+    async def test_other_tasks_are_still_cancelled(self):
+        """跳过自身不影响清理其他任务。"""
+        channel = self.make_channel()
+        started = asyncio.Event()
+
+        async def idle():
+            started.set()
+            await asyncio.Event().wait()
+
+        other = asyncio.create_task(idle())
+        channel._reconnect_tasks["other"] = other
+        await started.wait()
+
+        await channel._cleanup_reconnect_tasks()
+
+        self.assertTrue(other.cancelled() or other.done())
+
+
 if __name__ == "__main__":
     unittest.main()
