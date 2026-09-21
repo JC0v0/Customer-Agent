@@ -50,6 +50,12 @@ class PinduoduoKwargs(BaseModel):
     nickname: Optional[str] = None
     timestamp: Optional[str] = None
     user_msg_type: Optional[ContextType] = None
+    # 路由元信息（由 PDDChatMessage 产出，供 handler 决定动作）
+    origin: Optional[str] = None
+    action: Optional[str] = None
+    pdd_type: Optional[int] = None
+    pdd_sub_type: Optional[int] = None
+    template_name: Optional[str] = None
     shop_id: Optional[str] = None
     user_id: Optional[str] = None
     username: Optional[str] = None
@@ -69,7 +75,9 @@ class Context(BaseModel):
     def create_pinduoduo_context(cls, content=None, msg_id=None, from_user=None, from_uid=None,
                                 to_user=None, to_uid=None, nickname=None, timestamp=None,
                                 user_msg_type=None, shop_id=None, user_id=None, username=None, shop_name=None,
-                                raw_data=None,channel_type= None):
+                                raw_data=None, channel_type=None,
+                                origin=None, action=None, pdd_type=None, pdd_sub_type=None,
+                                template_name=None):
         """创建拼多多上下文实例的便捷方法"""
         kwargs = PinduoduoKwargs(
             msg_id=msg_id,
@@ -84,7 +92,12 @@ class Context(BaseModel):
             user_id=user_id,
             username=username,
             shop_name=shop_name,
-            raw_data=raw_data
+            raw_data=raw_data,
+            origin=origin,
+            action=action,
+            pdd_type=pdd_type,
+            pdd_sub_type=pdd_sub_type,
+            template_name=template_name,
         )
 
         return cls(
@@ -135,18 +148,22 @@ def make_account_key(
     )
 
 
-def make_conversation_key(context: Optional[Context]) -> str:
+def make_conversation_key(context: Optional[Context], customer_uid: Optional[str] = None) -> str:
     """Build an identity-safe conversation key.
 
     ``from_uid`` is the customer identity and must be part of the key; using
     only the merchant account would mix every customer into one history.
+
+    For merchant-sent messages the counterpart is ``to_uid`` rather than
+    ``from_uid``; callers pass ``customer_uid`` explicitly so that both
+    directions of one conversation resolve to the same key.
     """
     account_key = make_account_key(
         getattr(context, "channel_type", None),
         _context_value(context, "shop_id", "unknown"),
         _context_value(context, "user_id", "unknown"),
     )
-    customer_id = _context_value(context, "from_uid", "unknown")
+    customer_id = customer_uid or _context_value(context, "from_uid", "unknown")
     raw = f"{account_key}|customer|{customer_id}"
     return f"conversation_{sha256(raw.encode('utf-8')).hexdigest()}"
 

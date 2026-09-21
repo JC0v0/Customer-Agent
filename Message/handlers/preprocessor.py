@@ -72,14 +72,29 @@ class MessagePreprocessor:
         data.update(kwargs)
         return json.dumps([data], ensure_ascii=False)
 
+    # 内容为空时的兜底文案，避免把空串送给模型
+    EMPTY_CONTENT_FALLBACK = "[收到一条无法解析的消息]"
+    # 表情解析不到描述时的兜底
+    EMOTION_FALLBACK = "[表情]"
+
     def process(self, content: str, msg_type: Optional[ContextType] = None) -> str:
         """统一的消息预处理"""
         try:
-            # 根据消息类型进行特定处理
+            # 图片保留 URL：AI 需要据此查询商品知识，不能只给占位符
             if msg_type == ContextType.IMAGE:
-                return "[图片消息]"
-            elif msg_type == ContextType.VIDEO:
+                url = self._clean_text(content) if content else ""
+                return f"[图片] {url}" if url else "[图片]"
+
+            # 视频暂不处理内容（发送侧能力不可用，历史样本极少）
+            if msg_type == ContextType.VIDEO:
                 return "[视频消息]"
+
+            if msg_type == ContextType.EMOTION:
+                text = self._clean_text(content) if content else ""
+                return text if text and text != "None" else self.EMOTION_FALLBACK
+
+            if not content:
+                return self.EMPTY_CONTENT_FALLBACK
 
             # 1. 尝试解析为JSON
             parsed = self.safe_parse_json(content)
@@ -92,7 +107,7 @@ class MessagePreprocessor:
 
             # 3. 清理文本，直接返回纯文本
             cleaned = self._clean_text(content)
-            return cleaned
+            return cleaned or self.EMPTY_CONTENT_FALLBACK
 
         except Exception as e:
             logger.error(
@@ -103,6 +118,17 @@ class MessagePreprocessor:
     def _extract_key_info(self, data: Dict[str, Any]) -> str:
         """提取关键信息"""
         parts = []
+
+        # 卡片标题与说明文字：type=64 的规格/说明书卡、type=8 的订单卡
+        # 全靠这两项承载语义。之前不认这两个键，未识别模板会因为
+        # 「一个字段都提不出来」而把整串 JSON 丢给模型。
+        title = data.get('title')
+        if title:
+            parts.append(str(title))
+
+        detail = data.get('text') or data.get('sub_title') or data.get('description')
+        if detail and str(detail) != str(title):
+            parts.append(str(detail))
 
         # 商品信息
         goods_name = data.get('goods_name') or data.get('name')

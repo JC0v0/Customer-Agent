@@ -26,7 +26,12 @@ from Agent.CustomerAgent.tools import (
     get_product_knowledge,             # noqa: F401  — 注册 get_product_knowledge 工具
     search_customer_service_knowledge,  # noqa: F401  — 注册 search_customer_service_knowledge 工具
 )
-from bridge.context import Context, make_conversation_key, context_scope
+from bridge.context import (
+    Context,
+    _context_value,
+    context_scope,
+    make_conversation_key,
+)
 from bridge.reply import Reply, ReplyType
 from Agent.CustomerAgent.custom.session_manager import SessionManager
 from Agent.CustomerAgent.custom.tool_decorator import get_tools_for_llm
@@ -382,6 +387,54 @@ class CustomerAgent(Bot):
         if context is not None and context_scope(context).get("recipient_uid"):
             return make_conversation_key(context)
         return self._fallback_session_id
+
+    def _conversation_session_id(self, context: Context) -> str:
+        """会话键。客服侧消息的对话方是 to_uid，其余是 from_uid。
+
+        两个方向必须落到同一个会话，否则 AI 看不到自己刚推过的内容。
+        """
+        customer_uid = ""
+        if _context_value(context, "origin") == "merchant":
+            customer_uid = _context_value(context, "to_uid")
+        return make_conversation_key(context, customer_uid or None)
+
+    @staticmethod
+    def _context_role(context: Context) -> str:
+        """会话历史里的角色：客服侧记 assistant，其余记 user。
+
+        CONTEXT_ONLY 不只有客服侧消息：买家侧的 type=41「当前用户来自 商品详情页」
+        也走这条路径。若一律记成 assistant，模型会以为那句话是自己说的，
+        因此角色必须由 origin 推导，不能写死。
+        """
+        return "assistant" if _context_value(context, "origin") == "merchant" else "user"
+
+    async def record_context(self, context: Context) -> bool:
+        """把我方消息写入会话历史，但不生成回复。
+
+        用于客服侧文本与商品卡（CONTEXT_ONLY）：让 AI 知道刚刚推送过什么，
+        减少重复推荐。写入失败不影响主流程，调用方只需记录日志。
+        """
+        if not self._is_initialized:
+            if not await self.initialize_async():
+                return False
+
+        content = context.content if context is not None else ""
+        if not isinstance(content, str) or not content.strip():
+            return False
+
+        session_id = self._conversation_session_id(context)
+        try:
+            return await asyncio.to_thread(
+                self._session_manager.add_message,
+                session_id=session_id,
+                role=self._context_role(context),
+                content=content,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"record_context failed: error_type={type(exc).__name__}"
+            )
+            return False
 
     async def _compress_with_llm(
         self,
