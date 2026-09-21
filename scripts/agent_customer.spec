@@ -33,13 +33,25 @@ except (OSError, KeyError, TypeError):
 # ================================
 # collect_all 收集 playwright/driver/ 下的 node 与 JS，否则打包后启动浏览器会
 # 因驱动缺失而失败。配合 pdd_login 的 channel="chrome"，用户无需安装 Playwright 浏览器。
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 _pw_datas, _pw_binaries, _pw_hidden = collect_all("playwright")
+
+# litellm 在 import 阶段就会读取自身的数据文件：
+# get_model_cost_map() 会无条件读 litellm/model_prices_and_context_window_backup.json，
+# 即使远端取数成功也要读本地那份（它被当作实参先求值，用于完整性校验）。
+# 该文件没有任何兜底路径，缺失会在 import litellm 时抛 FileNotFoundError。
+# 只加 hiddenimports 不会带上数据文件，因此这里必须显式收集。
+# 排除 proxy/（24MB Web 控制台，本应用用不到）与 .tmp（tokenizer 缓存残留）。
+_llm_datas = collect_data_files("litellm", excludes=["**/proxy/**", "**/*.tmp"])
+
 _llm_hidden = [
     "litellm",
     "litellm.main",
     "litellm.llms",
 ]
+# litellm.utils 通过 importlib.resources 访问 litellm.litellm_core_utils.tokenizers
+# 下的词表文件，该子包必须整体收集，否则冻结后报 ModuleNotFoundError。
+_llm_hidden.extend(collect_submodules("litellm.litellm_core_utils"))
 for _provider_package in (
     "litellm.llms.openai",
     "litellm.llms.deepseek",
@@ -70,7 +82,7 @@ a = Analysis(
         # 图标文件
         (str(PROJECT_ROOT / "icon" / "icon.ico"), "icon"),
         (str(PROJECT_ROOT / "icon" / "Customer-Agent-qr.png"), "icon"),
-    ] + _pw_datas,
+    ] + _pw_datas + _llm_datas,
     hiddenimports=[
         # === PyQt6 & Fluent Widgets ===
         "PyQt6",
