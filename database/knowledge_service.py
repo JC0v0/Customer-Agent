@@ -6,7 +6,7 @@
 """
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, update, case, func, and_, or_
 from sqlalchemy.orm import Session
 import jieba
 from utils.logger_loguru import get_logger
@@ -101,7 +101,9 @@ class KnowledgeService:
                     existing.specifications = specifications
                 if extracted_content is not None:
                     existing.extracted_content = extracted_content
-                existing.last_extracted_at = datetime.now()
+                    if extracted_content.strip():
+                        existing.last_extracted_at = datetime.now()
+                # 同步第一阶段只更新商品信息，不得冒充一次成功的知识提取。
                 product = existing
                 session.flush()
             else:
@@ -117,6 +119,9 @@ class KnowledgeService:
                     thumb_url=thumb_url,
                     specifications=specifications,
                     extracted_content=extracted_content,
+                    last_extracted_at=(
+                        datetime.now() if extracted_content and extracted_content.strip() else None
+                    ),
                 )
                 session.add(product)
                 session.flush()
@@ -139,28 +144,54 @@ class KnowledgeService:
         goods_id: int,
         specifications: Optional[str] = None,
         extracted_content: Optional[str] = None,
+        *,
+        extraction_succeeded: bool = True,
     ) -> bool:
-        """仅更新产品的提取内容（用于第二阶段更新）"""
+        """保存提取结果；降级只能填空，且不能刷新成功提取时间。"""
         with self.get_session() as session:
-            stmt = select(ProductKnowledge).where(
-                and_(
+            values: Dict[str, Any] = {}
+            if specifications is not None:
+                values["specifications"] = specifications
+            if extracted_content is not None:
+                if extraction_succeeded:
+                    values["extracted_content"] = extracted_content
+                    if extracted_content.strip():
+                        values["last_extracted_at"] = datetime.now()
+                else:
+                    # 在 UPDATE 内判空，而不是先读后写，避免并发同步时把另一条
+                    # 已成功写入的知识覆盖掉。任何已有内容（含手动编辑）都保留。
+                    values["extracted_content"] = case(
+                        (
+                            or_(
+                                ProductKnowledge.extracted_content.is_(None),
+                                func.trim(ProductKnowledge.extracted_content, " \t\r\n") == "",
+                            ),
+                            extracted_content,
+                        ),
+                        else_=ProductKnowledge.extracted_content,
+                    )
+
+            if not values:
+                return False
+            result = session.execute(
+                update(ProductKnowledge)
+                .where(
                     ProductKnowledge.shop_id == shop_id,
-                    ProductKnowledge.goods_id == goods_id
+                    ProductKnowledge.goods_id == goods_id,
                 )
+                .values(**values)
             )
-            product = session.scalar(stmt)
-            if not product:
+            if result.rowcount == 0:
                 logger.warning(f"产品不存在，无法更新提取内容: shop_id={shop_id}, goods_id={goods_id}")
                 return False
 
-            if specifications is not None:
-                product.specifications = specifications
-            if extracted_content is not None:
-                product.extracted_content = extracted_content
-            product.last_extracted_at = datetime.now()
-
             session.commit()
-            logger.info(f"产品提取内容更新成功: shop_id={shop_id}, goods_id={goods_id}")
+            if extraction_succeeded:
+                logger.info(f"产品提取内容更新成功: shop_id={shop_id}, goods_id={goods_id}")
+            else:
+                logger.warning(
+                    f"产品提取降级处理完成（已有内容不覆盖）: shop_id={shop_id}, goods_id={goods_id}"
+                )
             return True
 
     def delete_product(self, product_id: int) -> bool:

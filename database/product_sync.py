@@ -5,8 +5,9 @@
 从拼多多API拉取商品列表，调用多模态LLM分析提取产品知识存入知识库。
 """
 import asyncio
+import re
 import threading
-from typing import Optional, Callable, List, Dict, Any
+from typing import Optional, Callable, List, Dict, Any, Tuple
 from dataclasses import dataclass
 import json
 import time
@@ -32,6 +33,8 @@ class SyncProgress:
     current_goods_name: str
     cancelled: bool = False
     phase: str = "fetching"  # "fetching": 抓取商品列表, "extracting": 提取知识
+    # LLM 未产出有效知识：只补基本信息或保留旧内容，不计为提取成功。
+    degraded: int = 0
 
 
 class ProductSyncService:
@@ -199,6 +202,7 @@ class ProductSyncService:
         progress.current = 0
         progress.success = 0
         progress.failed = 0
+        progress.degraded = 0
 
         for idx, product in enumerate(products_to_process):
             if self.is_cancelled():
@@ -249,6 +253,7 @@ class ProductSyncService:
         progress.current = 0
         progress.success = 0
         progress.failed = 0
+        progress.degraded = 0
 
         # 使用线程安全的计数器
         from threading import Lock
@@ -289,25 +294,35 @@ class ProductSyncService:
                 product_info = detail["product_info"]
 
                 # 调用LLM提取知识
-                extracted = await self._extract_product_knowledge(
+                extracted, extraction_succeeded = await self._extract_product_knowledge(
                     product,
                     product_info,
                     profile=llm_profile,
                 )
 
-                # 立即更新到数据库（仅更新提取内容）
-                await asyncio.to_thread(
+                # 由数据库层原子保护旧内容：降级只能填空，不能覆盖已有知识。
+                saved = await asyncio.to_thread(
                     self.knowledge_service.update_product_extracted_content,
                     shop_id=shop_db_id,
                     goods_id=goods_id,
                     specifications=json.dumps(product_info.get("specifications", [])),
                     extracted_content=extracted,
+                    extraction_succeeded=extraction_succeeded,
                 )
+                if not saved:
+                    raise RuntimeError("product_knowledge_update_failed")
 
                 with counter_lock:
-                    progress.success += 1
+                    if extraction_succeeded:
+                        progress.success += 1
+                        logger.info(f"商品知识提取成功: {goods_name} (ID: {goods_id})")
+                    else:
+                        progress.degraded += 1
+                        logger.warning(
+                            f"商品知识提取降级（仅补基础信息，已有内容不覆盖）: "
+                            f"{goods_name} (ID: {goods_id})"
+                        )
                     progress.current += 1
-                    logger.info(f"商品知识提取成功: {goods_name} (ID: {goods_id})")
                     if progress_callback:
                         progress_callback(progress)
 
@@ -336,7 +351,10 @@ class ProductSyncService:
         # 运行所有任务
         await asyncio.gather(*tasks)
 
-        logger.info(f"同步完成: 总计 {progress.total}, 成功 {progress.success}, 失败 {progress.failed}")
+        logger.info(
+            f"同步完成: 总计 {progress.total}, 成功 {progress.success}, "
+            f"降级 {progress.degraded}, 失败 {progress.failed}"
+        )
         return progress
 
     async def _extract_product_knowledge(
@@ -344,7 +362,7 @@ class ProductSyncService:
         list_product: Dict[str, Any],
         detail_product: Dict[str, Any],
         profile: Optional[LLMProfile] = None,
-    ) -> str:
+    ) -> Tuple[str, bool]:
         """
         调用LLM提取产品知识
 
@@ -353,12 +371,13 @@ class ProductSyncService:
             detail_product: 商品详情信息
 
         Returns:
-            LLM提取的产品知识文本
+            (知识文本, 是否提取成功)。失败返回基本信息和 False，调用方必须
+            将降级与成功分开计数，并防止覆盖已有知识。
         """
         profile = profile or self._snapshot_llm_profile()
         if profile is None:
             logger.warning("LLM profile unavailable, returning basic info only")
-            return self._format_basic_info(list_product, detail_product)
+            return self._format_basic_info(list_product, detail_product), False
 
         # 构建prompt
         thumb_url = list_product.get("thumb_url", "")
@@ -426,7 +445,7 @@ class ProductSyncService:
 
             # 尝试解析JSON
             try:
-                data = json.loads(content)
+                data = self._parse_knowledge_json(content)
                 # 记录提取到的规格信息
                 logger.debug(f"提取到的规格字段 - brand: {data.get('brand')}, origin: {data.get('origin')}, ingredients: {data.get('ingredients')}, spec_quantity: {data.get('spec_quantity')}, suitable_age: {data.get('suitable_age')}, shelf_life: {data.get('shelf_life')}")
 
@@ -472,17 +491,74 @@ class ProductSyncService:
                         output_parts.append("")
 
                 result = "\n".join(output_parts).strip()
-                return result
+                return result, True
 
-            except json.JSONDecodeError:
-                # 如果解析失败，返回原始内容
-                logger.warning("LLM输出不是合法JSON，返回原始内容")
-                return content
+            except (ValueError, TypeError) as exc:
+                # 非法 JSON / 空结果 / 错误字段类型均为降级，不能把错误原文入库。
+                logger.warning(
+                    f"LLM输出不是有效商品知识，降级为基本信息: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return self._format_basic_info(list_product, detail_product), False
 
         except Exception as e:
             logger.error(f"LLM调用失败: error_type={type(e).__name__}")
             # 降级返回基本信息
-            return self._format_basic_info(list_product, detail_product)
+            return self._format_basic_info(list_product, detail_product), False
+
+    @staticmethod
+    def _parse_knowledge_json(content: str) -> Dict[str, Any]:
+        """只接受非空的商品知识对象；容忍完整 Markdown 围栏，不猜测残缺 JSON。"""
+        # 某些兼容端点仍会返回围栏；只移除完整包裹，避免从说明文字中误取对象。
+        fenced = re.fullmatch(
+            r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n[ \t]*```",
+            content.strip(),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        data = json.loads(fenced.group(1) if fenced else content)
+        if not isinstance(data, dict):
+            raise ValueError("knowledge_must_be_object")
+
+        normalized: Dict[str, Any] = {}
+        for key in (
+            "brand", "origin", "ingredients", "spec_quantity", "suitable_age",
+            "shelf_life", "description", "usage",
+        ):
+            value = data.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError("invalid_knowledge_text_field")
+            if value.strip():
+                normalized[key] = value.strip()
+
+        points = data.get("key_points")
+        if points is not None:
+            if not isinstance(points, list) or any(not isinstance(p, str) for p in points):
+                raise ValueError("invalid_knowledge_key_points")
+            if cleaned := [p.strip() for p in points if p.strip()]:
+                normalized["key_points"] = cleaned
+
+        faqs = data.get("faq")
+        if faqs is not None:
+            if not isinstance(faqs, list):
+                raise ValueError("invalid_knowledge_faq")
+            clean_faqs = []
+            for faq in faqs:
+                if not isinstance(faq, dict):
+                    raise ValueError("invalid_knowledge_faq_item")
+                question, answer = faq.get("question"), faq.get("answer")
+                if not isinstance(question, str) or not isinstance(answer, str):
+                    raise ValueError("invalid_knowledge_faq_text")
+                if question.strip() and answer.strip():
+                    clean_faqs.append({"question": question.strip(), "answer": answer.strip()})
+            if clean_faqs:
+                normalized["faq"] = clean_faqs
+
+        # {} 或只有空字段不等于提取成功，不能用一个商品标题覆盖旧知识。
+        if not normalized:
+            raise ValueError("empty_knowledge")
+        return normalized
 
     def _format_basic_info(
         self,

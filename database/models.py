@@ -101,7 +101,8 @@ class ProductKnowledge(Base):
     extracted_content = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    last_extracted_at = Column(DateTime, default=datetime.now)
+    # 未成功提取时保持空；基本信息同步和降级均不能冒充成功提取。
+    last_extracted_at = Column(DateTime, nullable=True)
     shop = relationship("Shop", backref="product_knowledge")
 
     def __repr__(self):

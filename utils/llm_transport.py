@@ -255,6 +255,43 @@ def validate_redirect_origin(origin: str, redirected: str) -> None:
         raise EndpointPolicyError("Base URL 的跨主机或降级重定向已被阻止")
 
 
+def _apply_response_format(
+    payload: Dict[str, Any],
+    profile: LLMProfile,
+    response_format: Dict[str, Any],
+) -> None:
+    """保留 JSON 约束，仅绕过火山适配器已确认的 json_object 能力表缺项。
+
+    其他供应商 / 格式仍交给 LiteLLM 正常校验；不能因为能力未知就假定
+    服务端支持。探测失败也保留标准参数，让错误可见，而非静默丢参数。
+    """
+    payload["response_format"] = response_format
+    if (
+        profile.provider is not LLMProvider.VOLCENGINE
+        or response_format.get("type") != "json_object"
+    ):
+        return
+
+    try:
+        supported = _load_litellm().get_supported_openai_params(
+            model=profile.model_name, custom_llm_provider="volcengine"
+        )
+    except Exception as exc:
+        logger.warning(
+            "response_format capability probe failed; "
+            f"error_type={type(exc).__name__} provider=volcengine"
+        )
+        return
+
+    # None 表示未知而不是不支持；上游补齐能力表后自动回到标准路径。
+    if supported is None or "response_format" in supported:
+        return
+
+    payload.pop("response_format")
+    payload.setdefault("extra_body", {})["response_format"] = response_format
+    logger.debug("response_format routed via extra_body; provider=volcengine")
+
+
 def build_chat_payload(
     profile: LLMProfile,
     messages: List[Dict[str, Any]],
@@ -287,7 +324,7 @@ def build_chat_payload(
     if timeout is not None:
         payload["timeout"] = timeout
     if response_format is not None:
-        payload["response_format"] = response_format
+        _apply_response_format(payload, validated_profile, response_format)
     if use_tools and validated_profile.tool_policy is ToolPolicy.ENABLED and tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice

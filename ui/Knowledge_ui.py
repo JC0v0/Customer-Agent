@@ -39,8 +39,8 @@ logger = get_logger("KnowledgeUI")
 
 class SyncWorker(QThread):
     """同步工作线程"""
-    progress_updated = pyqtSignal(int, int, int, str, str)  # current, total, success, current_name, phase
-    sync_finished = pyqtSignal(int, int, bool)  # success, failed, cancelled
+    progress_updated = pyqtSignal(int, int, int, int, int, str, str)  # current, total, success, failed, degraded, name, phase
+    sync_finished = pyqtSignal(int, int, int, bool)  # success, failed, degraded, cancelled
 
     def __init__(
         self,
@@ -69,6 +69,8 @@ class SyncWorker(QThread):
                 progress.current,
                 progress.total,
                 progress.success,
+                progress.failed,
+                progress.degraded,
                 progress.current_goods_name,
                 progress.phase,
             )
@@ -84,7 +86,7 @@ class SyncWorker(QThread):
         )
 
         loop.close()
-        self.sync_finished.emit(result.success, result.failed, result.cancelled)
+        self.sync_finished.emit(result.success, result.failed, result.degraded, result.cancelled)
 
 
 class ProductDetailDialog(QDialog):
@@ -774,7 +776,10 @@ class KnowledgeUI(QWidget):
         )
 
         # 连接信号
-        def on_progress(current: int, total: int, success: int, current_name: str, phase: str):
+        def on_progress(
+            current: int, total: int, success: int, failed: int, degraded: int,
+            current_name: str, phase: str,
+        ):
             self.progress_bar.setMaximum(total)
             self.progress_bar.setValue(current)
             # 根据阶段显示不同的提示
@@ -786,14 +791,17 @@ class KnowledgeUI(QWidget):
                 if current == 1 or current % 10 == 0:
                     self._refresh_product_table()
             elif phase == "extracting":
-                self.progress_label.setText(f"[3/3] 提取商品知识: {current_name} ({current}/{total}, 成功 {success})")
+                self.progress_label.setText(
+                    f"[3/3] 提取商品知识: {current_name} ({current}/{total}, "
+                    f"成功 {success}, 降级 {degraded}, 失败 {failed})"
+                )
                 # 提取阶段也定期刷新，显示更新的知识
                 if current % 5 == 0:
                     self._refresh_product_table()
             else:
                 self.progress_label.setText(f"正在同步: {current_name} ({current}/{total}, 成功 {success})")
 
-        def on_finished(success: int, failed: int, cancelled: bool):
+        def on_finished(success: int, failed: int, degraded: int, cancelled: bool):
             self.progress_bar.setVisible(False)
             self.progress_label.setVisible(False)
             self.cancel_sync_btn.setVisible(False)
@@ -805,8 +813,10 @@ class KnowledgeUI(QWidget):
             if cancelled:
                 self._show_message("info", "同步已取消")
             else:
-                msg = f"同步完成: 成功 {success}, 失败 {failed}"
-                self._show_message("success", msg)
+                msg = f"同步完成: 成功 {success}, 降级 {degraded}, 失败 {failed}"
+                if degraded:
+                    msg += "。降级商品仅补基本信息，已有知识未被覆盖"
+                self._show_message("warning" if failed or degraded else "success", msg)
 
         self._sync_worker.progress_updated.connect(on_progress)
         self._sync_worker.sync_finished.connect(on_finished)

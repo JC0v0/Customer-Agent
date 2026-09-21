@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -193,6 +194,122 @@ class TransportPayloadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(client.client.follow_redirects)
             else:
                 self.assertFalse(client._client.follow_redirects)
+
+
+class ResponseFormatCompatibilityTests(unittest.TestCase):
+    def _payload(self, provider=LLMProvider.VOLCENGINE, response_format=None):
+        return transport.build_chat_payload(
+            _profile(provider, "doubao-seed-2.1-turbo"),
+            [{"role": "user", "content": "Return JSON"}],
+            use_tools=False,
+            response_format=response_format or {"type": "json_object"},
+        )
+
+    def test_missing_volcengine_json_capability_uses_extra_body_without_drop_params(self):
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=["temperature"]))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = self._payload()
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(payload["extra_body"]["response_format"], {"type": "json_object"})
+        self.assertNotIn("drop_params", payload)
+        sdk.get_supported_openai_params.assert_called_once_with(
+            model="doubao-seed-2.1-turbo", custom_llm_provider="volcengine"
+        )
+
+    def test_future_adapter_support_uses_standard_parameter(self):
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=["response_format"]))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = self._payload()
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertNotIn("extra_body", payload)
+
+    def test_unknown_capability_keeps_normal_validation(self):
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=None))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = self._payload()
+        self.assertIn("response_format", payload)
+        self.assertNotIn("extra_body", payload)
+
+    def test_probe_failure_is_safe_and_keeps_normal_validation(self):
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(side_effect=RuntimeError("secret-key")))
+        with mock.patch.object(transport, "litellm", sdk), mock.patch.object(transport, "logger") as logger:
+            payload = self._payload()
+        self.assertIn("response_format", payload)
+        self.assertNotIn("extra_body", payload)
+        self.assertNotIn("secret-key", str(logger.mock_calls))
+        logger.warning.assert_called_once()
+
+    def test_other_providers_are_not_given_an_unverified_passthrough(self):
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=[]))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = self._payload(LLMProvider.DEEPSEEK)
+        self.assertIn("response_format", payload)
+        self.assertNotIn("extra_body", payload)
+        sdk.get_supported_openai_params.assert_not_called()
+
+    def test_json_schema_is_not_silently_treated_as_json_object(self):
+        schema = {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object"}}}
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=[]))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = self._payload(response_format=schema)
+        self.assertEqual(payload["response_format"], schema)
+        self.assertNotIn("extra_body", payload)
+        sdk.get_supported_openai_params.assert_not_called()
+
+    def test_no_response_format_does_not_probe(self):
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(side_effect=AssertionError))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = transport.build_chat_payload(
+                _profile(LLMProvider.VOLCENGINE, "doubao-seed-2.1-turbo"),
+                [{"role": "user", "content": "hello"}], use_tools=False,
+            )
+        self.assertNotIn("response_format", payload)
+        self.assertNotIn("extra_body", payload)
+        sdk.get_supported_openai_params.assert_not_called()
+
+
+class VolcengineRequestBodyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_sdk_preserves_json_constraint_in_http_body(self):
+        """走真实 LiteLLM + OpenAI SDK，仅 HTTP 用本地 MockTransport，不访问服务端。"""
+        import httpx
+        import litellm as sdk
+        from openai import AsyncOpenAI
+
+        requests = []
+
+        def capture(request):
+            requests.append(request)
+            return httpx.Response(200, json={
+                "id": "local-test", "object": "chat.completion", "created": 0,
+                "model": "doubao-seed-2.1-turbo",
+                "choices": [{"index": 0, "message": {
+                    "role": "assistant", "content": '{"brand":"Test brand"}',
+                }, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(capture), follow_redirects=False)
+        client = AsyncOpenAI(
+            api_key="fake-local-test-key", base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+            http_client=http_client, max_retries=0,
+        )
+        with mock.patch.object(transport, "litellm", sdk), mock.patch.object(
+            transport, "_build_redirect_safe_client", return_value=client
+        ):
+            result = await transport.async_completion(
+                _profile(LLMProvider.VOLCENGINE, "doubao-seed-2.1-turbo"),
+                [{"role": "user", "content": "Extract a JSON object"}],
+                response_format={"type": "json_object"}, use_tools=False,
+            )
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].url.path, "/api/plan/v3/chat/completions")
+        body = json.loads(requests[0].content)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertNotIn("extra_body", body)
+        self.assertNotIn("drop_params", body)
+        self.assertNotIn("tools", body)
+        self.assertEqual(json.loads(result.content)["brand"], "Test brand")
+        self.assertTrue(client.is_closed())
 
 
 class ResponseAndErrorTests(unittest.IsolatedAsyncioTestCase):
