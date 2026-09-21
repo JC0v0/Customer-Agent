@@ -49,7 +49,15 @@ from Agent.CustomerAgent.custom.agent_config import (
 )
 from Agent.CustomerAgent.custom.llm_client import LLMClient, LLMResponse
 from Agent.CustomerAgent.custom.message_builder import MessageBuilder
+from Agent.CustomerAgent.custom.multimodal import (
+    decode_history_content,
+    encode_history_content,
+    extract_context_images,
+    has_image_blocks,
+    strip_image_blocks,
+)
 from Agent.CustomerAgent.custom.tool_executor import ToolExecutor, ToolResult
+from utils.llm_transport import LLMErrorCategory
 
 logger = get_logger("CustomerAgent")
 
@@ -240,15 +248,20 @@ class CustomerAgent(Bot):
                 # 压缩后重新加载，使本轮回复使用压缩后的历史
                 history = await asyncio.to_thread(self._session_manager.get_history, session_id)
 
+            # 当前这条买家消息附带的图片。只认 IMAGE 类型：买家在文本里粘
+            # 一个链接属于文本内容，不该因此触发图片抓取。
+            current_images = extract_context_images(context)
+
             # 预取商品列表（拼多多 HTTP，放工作线程）并注入 dependencies，
             # 避免 build_messages 内同步阻塞
             # Persist the user turn before invoking the model.  This keeps the
             # durable transcript complete even when the model or a tool fails.
+            # 带图消息用信封持久化，历史里才能把图片本身还原出来。
             await asyncio.to_thread(
                 self._session_manager.add_message,
                 session_id=session_id,
                 role="user",
-                content=query,
+                content=encode_history_content(query, current_images),
             )
 
             shop_id = dependencies.get("shop_id")
@@ -261,7 +274,12 @@ class CustomerAgent(Bot):
                 dependencies["product_list"] = ""
 
             # 构建 messages
-            messages = self._message_builder.build_messages(query, history, dependencies)
+            messages = self._message_builder.build_messages(
+                query,
+                history,
+                dependencies,
+                images=current_images,
+            )
 
             # 执行 Agent 循环
             final_content = await self._run_agent_loop(
@@ -300,7 +318,9 @@ class CustomerAgent(Bot):
         while loop_count < self._config.max_loops:
             # 1. 调用 LLM
             try:
-                response = await self._llm_client.chat(messages, tool_choice="auto")
+                response = await self._chat_with_vision_fallback(
+                    messages, tool_choice="auto"
+                )
             except Exception as e:
                 logger.error(
                     f"LLM 调用失败: error_type={type(e).__name__}"
@@ -356,7 +376,7 @@ class CustomerAgent(Bot):
                     "content": "[已达到最大工具调用次数，请基于已有信息给出最终回复。]",
                 })
                 try:
-                    final_response = await self._llm_client.chat(messages)
+                    final_response = await self._chat_with_vision_fallback(messages)
                     return final_response.content or assistant_msg["content"]
                 except Exception:
                     return assistant_msg["content"]
@@ -382,6 +402,50 @@ class CustomerAgent(Bot):
 
         # 兜底
         return messages[-1].get("content", "")
+
+    async def _chat_with_vision_fallback(
+        self,
+        messages: List[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """调用模型；图片内容被拒绝时退回纯文本，保证买家一定收到回复。
+
+        这里刻意不预判、也不缓存「该模型不支持图片」这一结论：
+
+        - 预判不可行：LiteLLM 的能力表对 volcengine / qwen / zhipu 的视觉
+          模型同样返回不支持（实测 doubao-1-5-vision-pro 与 qwen-vl-max 均为
+          False），拿它当开关会正好在支持视觉的模型上关掉图片。
+        - 缓存不可取：「模型不接受图片」和「这一张图片抓不到」在错误码上是
+          同一个参数类错误，无法区分。若因后者把前者永久记下来，一个本来
+          支持视觉的模型会被静默降级到重启为止——这个失败比多一次重试严重。
+
+        因此只做单次兜底：去掉图片块重试一次。真正不支持视觉的模型会因此
+        每次图片消息多一次往返，并在日志里持续可见，便于发现配置问题。
+        """
+        if not has_image_blocks(messages):
+            return await self._llm_client.chat(messages, **kwargs)
+
+        try:
+            return await self._llm_client.chat(messages, **kwargs)
+        except Exception as exc:
+            # 供应商拒绝图片内容时表现为参数类错误（BadRequest / 参数不支持）
+            if getattr(exc, "category", None) is not LLMErrorCategory.PARAMETER:
+                raise
+
+            # 重试失败会原样抛出；此时不改变任何判定，交由上层按原有的
+            # 「LLM 不可用」路径处理。
+            stripped = strip_image_blocks(messages)
+            response = await self._llm_client.chat(stripped, **kwargs)
+            messages[:] = stripped
+
+            profile = getattr(self, "_active_profile", None)
+            logger.warning(
+                "图片内容被模型拒绝，本轮已降级为纯文本；"
+                f"provider={getattr(profile, 'provider', '')} "
+                f"model={getattr(profile, 'model_name', '')}。"
+                "若该模型支持视觉，请检查图片地址是否可被供应商访问。"
+            )
+            return response
 
     def _session_id(self, context: Optional[Context], query: str) -> str:
         if context is not None and context_scope(context).get("recipient_uid"):
@@ -447,16 +511,23 @@ class CustomerAgent(Bot):
         压缩从未真正执行（历史只增不减）。
         """
 
+        def summary_line(msg: Dict[str, Any]) -> str:
+            """压缩输入的一行。
+
+            带图消息在库里是信封 JSON，直接截取等于把 JSON 塞给摘要模型；
+            图片本身不参与文字摘要，只保留文本并注明当时有图——压缩会删掉
+            原始消息，这句注明是「买家发过图」唯一能留下的线索。
+            """
+            text, images = decode_history_content(msg.get("content", ""))
+            suffix = "（含图片）" if images else ""
+            return f"[{msg.get('role', 'unknown')}]: {text[:200]}{suffix}"
+
         async def summary_llm(messages: List[Dict[str, Any]]) -> str:
             """异步调用 LLM 生成摘要"""
             summary_prompt = (
                 "请简洁地总结以下对话的要点，保留关键信息和用户意图。\n\n"
                 f"对话内容（共 {len(messages)} 条消息）：\n"
-                + "\n".join(
-                    f"[{msg.get('role', 'unknown')}]: {msg.get('content', '')[:200]}"
-                    for msg in messages
-                    if msg.get("content")
-                )
+                + "\n".join(summary_line(msg) for msg in messages if msg.get("content"))
             )
 
             try:
