@@ -2,6 +2,10 @@
 
 电商AI客服桌面应用程序，基于 PyQt6 构建，支持多平台渠道集成，集成 AI 大模型实现智能自动回复。
 
+> **同作者产品：[回柚](https://huiuai.cn/?utm_source=github&utm_medium=readme&utm_campaign=customer_agent&utm_content=readme_top)**
+>
+> 贴在聊天窗口旁边的话术面板和 AI 助手，适合由客服选择话术、确认回复的工作方式。支持 Windows 和 macOS；本地话术功能免费，团队版提供 AI 推荐与协作。
+
 ## 下载安装
 
 > 普通用户无需配置 Python 环境，直接下载安装包即可使用。
@@ -34,6 +38,23 @@
 | `get_product_knowledge` | 查询指定商品的详细知识（成分、规格、用法、价格等） |
 | `search_customer_service_knowledge` | 搜索客服知识库（售后、物流、退款等政策问答） |
 | `transfer_conversation` | 转接会话给人工客服 |
+
+## 同作者产品：回柚
+
+如果你的客服工作以人工接待为主，可以看看回柚：它贴在现有聊天窗口旁边，让客服更快找到话术，并参考 AI 建议完成回复。
+
+- **常用话术随手可用**：文字、图片和附件点选发送，支持快捷键。
+- **AI 给建议，客服确认发送**：根据商品知识和店铺规则生成带依据的回复，可修改后再发送（团队版）。
+- **好回复沉淀给团队**：支持话术同步、客服提交和主管审核（团队版）。
+- **Windows / macOS 都能用**：macOS 支持 Apple 芯片；本地话术功能免费，不登录也能使用。
+
+<a href="https://huiuai.cn/?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=customer_agent&amp;utm_content=readme_demo">
+  <img src="assets/huiyou/reply-demo.gif" alt="回柚界面演示：识别买家问题、给出带依据的 AI 建议、客服确认填入聊天框" width="340">
+</a>
+
+*界面演示中的买家、商品和话术均为演示数据。AI 推荐和团队协作属于团队版，可在官网了解功能与试用方式。*
+
+**[了解回柚并下载免费本地版](https://huiuai.cn/?utm_source=github&utm_medium=readme&utm_campaign=customer_agent&utm_content=readme_intro)**
 
 ## 环境要求
 
