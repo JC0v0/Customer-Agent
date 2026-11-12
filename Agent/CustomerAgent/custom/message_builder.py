@@ -90,6 +90,19 @@ class MessageBuilder:
 - 参数：shop_id、user_id、recipient_uid
 - 示例：用户说"转人工"→调用此工具
 
+5️⃣ query_order_status（查询订单状态与物流）
+- 用途：查买家订单状态、物流进度、发货情况（拼多多/抖音双渠道）
+- 参数：channel_type、shop_id、user_id、recipient_uid、recipient_nick
+  （均由系统按当前会话自动注入，无需你传）、order_sn（可选，订单号）
+- 触发条件：用户问"我的订单/发货了吗/物流到哪了/什么时候到/查订单"
+  或消息里出现订单号 → 调用此工具
+- 能力：依据会话买家 uid/昵称直接调取该买家在本店的订单
+  （与真人客服在后台看到『这个客户的订单』一致），无需向用户索要订单号；
+  用户主动报了订单号时在其订单内精确匹配定位某一单
+- 决策规则：用户提到订单相关话题时**必须先调用此工具**再回答，
+  不要凭空编造订单状态；查到多个订单时逐一播报；
+  查不到时如实告诉用户没查到，绝不编造订单或物流信息
+
 💡 重要提示：
 - 工具参数必须使用【当前会话信息】中的值！
 - 知识库没答案时，引导用户查看商品详情页～
@@ -117,6 +130,14 @@ class MessageBuilder:
         """
         from_uid = _context_value(context, "from_uid")
 
+        # 买家平台展示昵称（抖音渠道为真实昵称，来自消息 ext/nickname；
+        # 抖音订单接口按真实昵称精确反查，见 Channel/douyin/ORDER_API.md）。
+        # 昵称缺失时回退 from_uid：拼多多等渠道用数字 uid 归因、不用昵称，
+        # 但受信任注入白名单要求该字段非空才能执行工具。
+        recipient_nick = _context_value(context, "nickname")
+        if not recipient_nick.strip():
+            recipient_nick = from_uid
+
         # shop_id 保持整数类型，便于工具参数注入
         shop_id = _context_value(context, "shop_id") or 0
         if isinstance(shop_id, str) and shop_id.isdigit():
@@ -129,6 +150,7 @@ class MessageBuilder:
             "user_id": _context_value(context, "user_id"),
             "from_uid": from_uid,
             "recipient_uid": from_uid,  # 工具参数通常叫 recipient_uid，兼容两种命名
+            "recipient_nick": recipient_nick,
         }
 
     def fetch_product_list_text(self, shop_id: Any, user_id: Any) -> str:
@@ -221,6 +243,7 @@ class MessageBuilder:
                 session_info += f"- recipient_uid: {_safe_session_value(dependencies.get('recipient_uid', ''))}（接收消息的用户UID，发送商品卡片时使用）\n"
                 session_info += f"- shop_name: {_safe_session_value(dependencies.get('shop_name', ''))}（店铺名称）\n"
                 session_info += f"- channel_type: {_safe_session_value(dependencies.get('channel_type', ''))}（渠道类型）\n"
+                session_info += f"- recipient_nick: {_safe_session_value(dependencies.get('recipient_nick', ''))}（买家平台昵称，订单查询自动使用，无需传给工具）\n"
                 session_info += "\n【重要】调用工具时，shop_id、user_id 等参数必须使用上面【当前会话信息】中给出的值！"
                 content += session_info
 

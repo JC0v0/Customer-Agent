@@ -107,6 +107,34 @@ class Context(BaseModel):
             channel_type=channel_type
         )
 
+    @classmethod
+    def create_douyin_context(cls, content=None, msg_id=None, from_user=None, from_uid=None,
+                              to_user=None, to_uid=None, nickname=None, timestamp=None,
+                              user_msg_type=None, shop_id=None, user_id=None, username=None, shop_name=None,
+                              raw_data=None, channel_type=None):
+        """创建抖音上下文实例（字段与拼多多一致，channel_type 默认 DOUYIN）"""
+        kwargs = PinduoduoKwargs(
+            msg_id=msg_id,
+            from_user=from_user,
+            from_uid=from_uid,
+            to_user=to_user,
+            to_uid=to_uid,
+            nickname=nickname,
+            timestamp=timestamp,
+            user_msg_type=user_msg_type,
+            shop_id=shop_id,
+            user_id=user_id,
+            username=username,
+            shop_name=shop_name,
+            raw_data=raw_data,
+        )
+        return cls(
+            type=user_msg_type or ContextType.TEXT,
+            content=content,
+            kwargs=kwargs,
+            channel_type=channel_type or ChannelType.DOUYIN,
+        )
+
 
 def _context_value(context: Optional[Context], name: str, default: str = "") -> str:
     """Safely read a channel-specific value from a Context.
@@ -144,6 +172,27 @@ def make_account_key(
             channel_value(channel_type),
             str(shop_id or "unknown"),
             str(user_id or "unknown"),
+        )
+    )
+
+
+def make_handoff_key(
+    channel_type: Optional[Union[ChannelType, str]],
+    shop_id: Optional[Union[str, int]],
+    uid: Optional[Union[str, int]],
+) -> str:
+    """Build a channel-scoped handoff (转人工) key.
+
+    必须包含 channel 维度，否则同一买家 UID 出现在两个平台时会互相误判
+    "已转人工"（PDD 的买家 UID 与抖音的买家 UID 完全独立、可能撞号）。
+    格式：{channel}|{shop_id}|{uid}。mark_handoff 与 is_handoff 必须共用本函数，
+    否则标记与检测对不上。
+    """
+    return "|".join(
+        (
+            channel_value(channel_type),
+            str(shop_id or "unknown"),
+            str(uid or "unknown"),
         )
     )
 
