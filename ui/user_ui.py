@@ -77,7 +77,8 @@ class LoginThread(QThread):
             result = loop.run_until_complete(
                 account_service.login(
                     name=self.account_data["username"],
-                    password=self.account_data["password"]
+                    password=self.account_data["password"],
+                    channel_name=self.account_data.get("channel_name", "pinduoduo"),
                 )
             )
             
@@ -893,24 +894,32 @@ class AddAccountDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("通过登录添加账号")
         self.setModal(True)
-        self.resize(400, 200)
+        self.resize(400, 240)
         self.setupUI()
     
     def setupUI(self):
         """设置对话框UI"""
-        from qfluentwidgets import LineEdit, PrimaryPushButton, PushButton
+        from qfluentwidgets import ComboBox, LineEdit, PrimaryPushButton, PushButton
 
         layout = QFormLayout(self)
         layout.setSpacing(15)
+
+        self.channel_combo = ComboBox(self)
+        self.channel_combo.addItem("拼多多")
+        self.channel_combo.setItemData(0, "pinduoduo")
+        self.channel_combo.addItem("抖音")
+        self.channel_combo.setItemData(1, "douyin")
+        self.channel_combo.setFixedSize(300, 32)
         
         # 账号信息
         self.username_edit = LineEdit(self)
-        self.username_edit.setPlaceholderText("请输入拼多多账号用户名")
+        self.username_edit.setPlaceholderText("请输入账号用户名")
         self.username_edit.setFixedSize(300, 32)
         self.password_edit = LineEdit(self)
         self.password_edit.setEchoMode(LineEdit.EchoMode.Password)
         self.password_edit.setPlaceholderText("请输入密码")
         self.password_edit.setFixedSize(300, 32)
+        layout.addRow("渠道:", self.channel_combo)
         layout.addRow("用户名:", self.username_edit)
         layout.addRow("密码:", self.password_edit)
         
@@ -947,6 +956,7 @@ class AddAccountDialog(QDialog):
     def getAccountInfo(self) -> dict:
         """获取账号信息"""
         return {
+            "channel_name": self.channel_combo.currentData() or "pinduoduo",
             "username": self.username_edit.text().strip(),
             "password": self.password_edit.text().strip()
         }

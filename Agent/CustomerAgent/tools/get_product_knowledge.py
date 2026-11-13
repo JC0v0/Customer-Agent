@@ -4,7 +4,7 @@
 
 根据商品ID和店铺ID获取产品详细知识。
 """
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel, Field
 from Agent.CustomerAgent.custom.tool_decorator import agent_tool
 
@@ -19,8 +19,9 @@ def _get_knowledge_service() -> KnowledgeService:
 
 class GetProductKnowledgeParams(BaseModel):
     """获取产品知识参数"""
-    goods_id: int = Field(..., description="商品ID（必须提供）")
-    shop_id: int = Field(..., description="店铺ID（必须提供）")
+    channel_type: Optional[str] = Field(default=None, description="渠道类型（受信任注入）")
+    goods_id: Optional[int] = Field(default=None, description="商品ID（必须提供）")
+    shop_id: Optional[Union[str, int]] = Field(default=None, description="店铺ID（必须提供）")
 
 
 @agent_tool(
@@ -51,6 +52,7 @@ def get_product_knowledge(params: GetProductKnowledgeParams) -> str:
         shop_id=params.shop_id,
         query=None,
         goods_id=params.goods_id,
+        channel_name=params.channel_type,
     )
 
     return knowledge_service.format_search_result(result)

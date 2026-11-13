@@ -10,7 +10,7 @@ from sqlalchemy import select, update, case, func, and_, or_
 from sqlalchemy.orm import Session
 import jieba
 from utils.logger_loguru import get_logger
-from database.models import Base, ProductKnowledge, CustomerServiceKnowledge, Shop
+from database.models import Base, Channel, ProductKnowledge, CustomerServiceKnowledge, Shop
 from database.db_manager import db_manager
 
 logger = get_logger("KnowledgeService")
@@ -387,7 +387,11 @@ class KnowledgeService:
 
     # ========== 检索 ==========
 
-    def _resolve_shop_id(self, shop_id: int) -> Optional[int]:
+    def _resolve_shop_id(
+        self,
+        shop_id: int,
+        channel_name: Optional[str] = None,
+    ) -> Optional[int]:
         """
         将店铺原始ID转换为数据库中的Shop.id
 
@@ -399,6 +403,10 @@ class KnowledgeService:
         """
         with self.get_session() as session:
             stmt = select(Shop).where(Shop.shop_id == str(shop_id))
+            if channel_name:
+                stmt = stmt.join(
+                    Channel, Shop.channel_id == Channel.id
+                ).where(Channel.channel_name == str(channel_name))
             shop = session.scalar(stmt)
             if shop:
                 return shop.id
@@ -413,6 +421,7 @@ class KnowledgeService:
         query: Optional[str] = None,
         goods_id: Optional[int] = None,
         limit: int = 10,
+        channel_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         检索知识库
@@ -422,6 +431,7 @@ class KnowledgeService:
             query: 关键词查询，可为空
             goods_id: 精确查询特定商品，可为空
             limit: 返回结果最大数量
+            channel_name: 渠道名称；提供时只在该渠道下解析店铺
 
         Returns:
             {
@@ -435,7 +445,7 @@ class KnowledgeService:
         }
 
         # 将店铺原始ID转换为数据库中的Shop.id
-        db_shop_id = self._resolve_shop_id(shop_id)
+        db_shop_id = self._resolve_shop_id(shop_id, channel_name=channel_name)
         if db_shop_id is None:
             return result
 

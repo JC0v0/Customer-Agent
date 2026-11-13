@@ -51,6 +51,7 @@ class SyncWorker(QThread):
         user_id: str,
         is_full_sync: bool,
         product_sync: ProductSyncService,
+        channel_name: str = "pinduoduo",
         parent=None,
     ):
         super().__init__(parent)
@@ -59,6 +60,7 @@ class SyncWorker(QThread):
         self.user_id = user_id
         self.is_full_sync = is_full_sync
         self.product_sync = product_sync
+        self.channel_name = channel_name
         self._cancelled = False
 
     def run(self):
@@ -77,11 +79,17 @@ class SyncWorker(QThread):
                 progress.phase,
             )
 
+        shop_id = (
+            int(self.pdd_shop_id)
+            if str(self.pdd_shop_id).strip().isdigit()
+            else str(self.pdd_shop_id)
+        )
         result = loop.run_until_complete(
             self.product_sync.sync_shop(
-                shop_id=int(self.pdd_shop_id),
+                shop_id=shop_id,
                 shop_db_id=self.shop_db_id,
                 user_id=self.user_id,
+                channel_name=self.channel_name,
                 is_full_sync=self.is_full_sync,
                 progress_callback=progress_callback,
             )
@@ -740,7 +748,11 @@ class KnowledgeUI(QWidget):
         with self.knowledge_service.get_session() as session:
             from sqlalchemy import select
             from sqlalchemy.orm import joinedload
-            stmt = select(Shop).where(Shop.id == shop_id).options(joinedload(Shop.accounts))
+            stmt = (
+                select(Shop)
+                .where(Shop.id == shop_id)
+                .options(joinedload(Shop.accounts), joinedload(Shop.channel))
+            )
             return session.scalar(stmt)
 
     def _start_sync(self, shop: Shop, is_full_sync: bool):
@@ -782,6 +794,9 @@ class KnowledgeUI(QWidget):
             user_id=user_id,
             is_full_sync=is_full_sync,
             product_sync=self.product_sync,
+            channel_name=getattr(
+                getattr(shop, "channel", None), "channel_name", "pinduoduo"
+            ),
             parent=self,
         )
 

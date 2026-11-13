@@ -2,7 +2,7 @@
 产品知识自动同步服务
 =================
 
-从拼多多API拉取商品列表，调用多模态LLM分析提取产品知识存入知识库。
+按店铺渠道拉取商品列表，调用多模态 LLM 分析提取产品知识存入知识库。
 """
 import asyncio
 import re
@@ -21,6 +21,16 @@ from utils.llm_provider import LLMProfile, ProfileValidationError
 from utils.llm_transport import async_completion
 
 logger = get_logger("ProductSync")
+
+
+def _get_product_manager(channel_name: str, shop_id: str, user_id: str):
+    """按渠道创建商品管理器，避免将抖音账号请求发送到拼多多。"""
+    if str(channel_name).strip().lower() == "douyin":
+        from Channel.douyin.utils.API.product_manager import (
+            ProductManager as DouyinProductManager,
+        )
+        return DouyinProductManager(shop_id=str(shop_id), user_id=str(user_id))
+    return ProductManager(shop_id=str(shop_id), user_id=str(user_id))
 
 
 @dataclass
@@ -83,9 +93,10 @@ class ProductSyncService:
 
     async def sync_shop(
         self,
-        shop_id: int,
+        shop_id: str,
         shop_db_id: int,
         user_id: str,
+        channel_name: str = "pinduoduo",
         is_full_sync: bool = False,
         progress_callback: Optional[Callable[[SyncProgress], None]] = None,
     ) -> SyncProgress:
@@ -96,9 +107,10 @@ class ProductSyncService:
         第二阶段：批量异步识别每个商品的详细信息
 
         Args:
-            shop_id: 店铺ID（拼多多的shop_id）
+            shop_id: 店铺ID
             shop_db_id: 店铺在数据库中的ID
-            user_id: 用户ID（用于拼多多API认证）
+            user_id: 用户ID（用于平台认证）
+            channel_name: 店铺所属渠道，默认拼多多以保持兼容
             is_full_sync: True=全量同步，False=增量同步（仅同步本地不存在的商品）
             progress_callback: 进度回调，每次更新进度调用
 
@@ -107,13 +119,17 @@ class ProductSyncService:
         """
         self._reset_cancellation()
         llm_profile = self._snapshot_llm_profile()
-        pm = ProductManager(shop_id=str(shop_id), user_id=user_id)
+        pm = _get_product_manager(channel_name, shop_id, user_id)
+        require_platform = str(channel_name).strip().lower() == "douyin"
 
         # ================== 第一阶段：快速抓取商品列表 ==================
         logger.info("=== 第一阶段：开始抓取商品列表 ===")
 
         # 第一页获取总数量
-        first_page = await asyncio.to_thread(pm.get_product_list, page=1, size=20)
+        first_page_kwargs = {"page": 1, "size": 20}
+        if require_platform:
+            first_page_kwargs["require_platform"] = True
+        first_page = await asyncio.to_thread(pm.get_product_list, **first_page_kwargs)
         if not first_page["success"]:
             logger.error("获取商品列表失败: provider_error=true")
             progress = SyncProgress(
@@ -136,29 +152,42 @@ class ProductSyncService:
         )
 
         # 分页拉取所有商品
+        source_page_size = max(1, int(first_page.get("size") or 20))
+        max_pages = (total + source_page_size - 1) // source_page_size
         current_page = 1
         all_products: List[Dict[str, Any]] = []
+        seen_goods_ids = set()
 
-        while True:
+        while current_page <= max_pages:
             if self.is_cancelled():
                 progress.cancelled = True
                 logger.info("同步已被用户取消")
                 break
 
-            page_result = await asyncio.to_thread(
-                pm.get_product_list, page=current_page, size=50
-            )
+            if current_page == 1:
+                page_result = first_page
+            else:
+                page_kwargs = {"page": current_page, "size": source_page_size}
+                if require_platform:
+                    page_kwargs["require_platform"] = True
+                page_result = await asyncio.to_thread(pm.get_product_list, **page_kwargs)
             if not page_result["success"]:
                 logger.error(
                     f"获取第 {current_page} 页失败: provider_error=true"
                 )
-                break
+                progress.failed += 1
+                return progress
 
             products = page_result["products"]
             if not products:
                 break
 
-            all_products.extend(products)
+            for product in products:
+                goods_id = product.get("goods_id")
+                if goods_id in seen_goods_ids:
+                    continue
+                seen_goods_ids.add(goods_id)
+                all_products.append(product)
             current_page += 1
 
             # 更新进度

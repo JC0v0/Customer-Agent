@@ -37,6 +37,10 @@ class ToolResult:
 
 
 class ToolExecutor:
+    # 单个工具执行超时（秒）。工具在 to_thread 线程里跑，Python 无法强杀
+    # 线程，但超时后循环不再等待、直接给模型回错误结果，避免整体卡死。
+    TOOL_EXEC_TIMEOUT_SECONDS = 30
+
     async def execute_parallel(
         self,
         tool_calls: List[Any],
@@ -49,13 +53,24 @@ class ToolExecutor:
 
         async def run(call: Any) -> ToolResult:
             try:
-                content = await asyncio.to_thread(
-                    execute_tool,
-                    call.function.name,
-                    call.function.arguments,
-                    dependencies,
+                content = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        execute_tool,
+                        call.function.name,
+                        call.function.arguments,
+                        dependencies,
+                    ),
+                    timeout=self.TOOL_EXEC_TIMEOUT_SECONDS,
                 )
                 return ToolResult(call.id, content)
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"tool execution timeout: {call.function.name} "
+                    f"after {self.TOOL_EXEC_TIMEOUT_SECONDS}s"
+                )
+                return ToolResult(
+                    call.id, "[工具执行超时，请告知用户稍后重试，不要编造结果]"
+                )
             except Exception as exc:
                 logger.error(
                     f"tool execution failed: {call.function.name}: {type(exc).__name__}"

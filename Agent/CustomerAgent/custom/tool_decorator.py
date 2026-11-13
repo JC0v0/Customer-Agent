@@ -100,6 +100,9 @@ def execute_tool(
             "shop_id",
             "user_id",
             "recipient_uid",
+            # 买家平台昵称同样受信任注入：抖音订单接口按昵称精确反查，
+            # 若允许 LLM 传入会话买家的昵称，可能查到他人的订单（越权）
+            "recipient_nick",
         }
 
         for field_name in model_fields:
