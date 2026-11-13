@@ -10,7 +10,7 @@ DouyinLogin.login() 流程：
   1. 打开登录页，按 URL 判断登录态（已登录访问 login 页会自动跳走）
   2. 未登录 → 手机号+验证码（或邮箱+密码）登录；滑块/短信验证需用户手动一次
   3. 登录成功 → 自动挂 WS 抓取 pigeon 会话凭据（token + pigeon_sign + device_id）
-  4. 保存到 temp\\dy_session_live.json（pigeon 传输模块直接复用，一次登录管长期）
+  4. 保存到按账号隔离的临时会话文件（pigeon 传输模块直接复用，一次登录管长期）
   5. 返回含 pigeon 会话 + 店铺信息的 JSON（键名与拼多多契约一致）
 
 浏览器启动（本地 Chrome/Edge 探测、CDP 回退、profile 锁清理等）沿用原实现。
@@ -19,8 +19,9 @@ import os
 # 必须在导入 playwright 之前设置浏览器路径
 from pathlib import Path
 from utils.path_utils import get_app_dir
-from utils.runtime_path import get_data_path, get_temp_path
+from utils.runtime_path import get_data_path
 from utils.logger_loguru import get_logger
+from Channel.douyin.session_paths import pigeon_session_path
 
 # 设置 Playwright 浏览器路径
 app_dir = get_app_dir()
@@ -414,7 +415,7 @@ class DouyinLogin():
              - 邮箱（用户名含 @）→ 邮箱 + 密码
           4. 等待登录成功：滑块验证/短信验证需用户手动完成一次（风控无法全自动）
           5. 跳转飞鸽工作台 → 挂 WS 自动抓取 token + pigeon_sign（会话级凭据）
-          6. 保存到 temp\\dy_session_live.json（pigeon 传输模块直接复用）
+          6. 保存到按账号隔离的临时会话文件（pigeon 传输模块直接复用）
           7. 返回包含 pigeon 会话 + 店铺信息的 JSON 字符串（键名与拼多多契约一致）
 
         Returns:
@@ -696,8 +697,8 @@ class DouyinLogin():
         return captured
 
     def _save_pigeon_session(self, session: Dict[str, Any]) -> None:
-        # 与 douyin_lifecycle.PIGEON_SESSION_PATH 共用运行时临时目录
-        out = get_temp_path("dy_session_live.json")
+        # 每个账号一份凭据，避免多开时互相覆盖。
+        out = pigeon_session_path(self.profile_scope, self.name)
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             json.dump(session, f, ensure_ascii=False, indent=1)

@@ -87,8 +87,8 @@ class QueryOrderStatusParams(BaseModel):
     recipient_nick: Optional[str] = Field(
         default=None,
         description="当前对话买家在平台展示的昵称（受信任注入，来自会话上下文，"
-                    "LLM 无需提供）。抖音渠道用它精确反查该买家在本店的订单，"
-                    "无需买家报订单号。"
+                    "LLM 无需提供）。抖音渠道用它辅助定位候选订单；昵称可能重名，"
+                    "最终仍要求订单号在会话或候选订单中精确命中。"
     )
     days: Optional[int] = Field(
         default=90,
@@ -130,25 +130,55 @@ def _query_douyin_orders(params) -> str:
         buyer_nick = str(params.recipient_nick or "").strip()
         days = params.days or 90
 
+        # 昵称占位值（pigeon_xxx / 直接等于 conv_id）不是真实昵称，不能用于反查。
+        nick_usable = bool(
+            buyer_nick
+            and buyer_nick != str(params.recipient_uid or "")
+            and not buyer_nick.startswith("pigeon_")
+        )
         orders = []
-        # 1) 买家主动报了订单号 → 单号精确查
+
+        # 1) 最安全的来源：当前会话里买家自己发过/卡片出现过的订单号。
+        #    买家消息在调用模型前已写入 agent_messages，当前这条也能读到。
+        history_result = oq.get_recent_orders(
+            buyer_uid=params.recipient_uid,
+            days=days,
+        )
+        if history_result.get("success"):
+            orders = history_result.get("orders") or []
+
+        # 2) 买家主动报了订单号：只接受“当前买家候选订单里确实有这个号”的结果，
+        #    绝不按订单号直接查全店订单，避免查到别人的订单。
         if order_sn:
-            detail = oq.get_order_detail(order_sn)
-            if detail is not None:
-                orders = [detail]
-        # 2) 有真实昵称 → 昵称反查（searchlist buyer= 精确匹配）
-        elif buyer_nick:
-            result = oq.get_buyer_orders(buyer_nick)
-            if result.get("success"):
-                orders = result.get("orders") or []
-        # 3) 兜底：消息历史订单号 + 真实接口补详情
-        if not orders:
-            result = oq.get_recent_orders(
-                buyer_uid=params.recipient_uid,
-                days=days,
-            )
-            if result.get("success"):
-                orders = result.get("orders") or []
+            matched = _match_douyin_order_sn(orders, order_sn)
+            if not matched and nick_usable:
+                # 会话历史没有时，昵称反查只作为候选集合；仍要求订单号精确命中。
+                nick_result = oq.get_buyer_orders(buyer_nick)
+                if nick_result.get("success"):
+                    matched = _match_douyin_order_sn(
+                        nick_result.get("orders") or [], order_sn
+                    )
+            if not matched:
+                return (
+                    f"在您本店的订单里没找到订单号 '{order_sn}' 哦，"
+                    f"请核对一下订单号，或到抖店App「我的订单」里查看～"
+                )
+            orders = matched
+
+        # 3) 没有订单号时，昵称反查只用于“没有历史订单”的兜底。
+        #    为避免昵称重名导致串单，不直接返回订单详情，先请买家提供订单号。
+        if not orders and not order_sn and nick_usable:
+            nick_result = oq.get_buyer_orders(buyer_nick)
+            if nick_result.get("success") and nick_result.get("orders"):
+                logger.info(
+                    f"抖音昵称反查命中候选订单，但为避免重名串单不直接返回: "
+                    f"shop_id={params.shop_id}, candidate_count="
+                    f"{len(nick_result.get('orders') or [])}"
+                )
+                return (
+                    "我这边能看到您在本店有订单，但为了确认是您本人的订单，"
+                    "麻烦把订单号发我一下，我马上帮您查物流～"
+                )
 
         if not orders:
             logger.info(
@@ -192,9 +222,9 @@ def _query_douyin_orders(params) -> str:
     name="query_order_status",
     description=(
         "查询订单状态与物流信息。当客户询问'我的订单在哪里''发货了吗''物流到哪了'"
-        "'订单状态'等时使用。本工具依据会话买家的 uid 直接调取该买家在本店的订单"
-        "（与真人客服在后台看到『这个客户的订单』一致），无需向用户索要订单号。"
-        "若用户主动给了订单号，会在其订单内精确匹配定位某一单；否则返回其全部订单。"
+        "'订单状态'等时使用。拼多多依据会话买家的 uid 直接调取该买家在本店的订单；"
+        "抖音优先使用会话里出现过的订单卡片/订单号，缺失时会提示买家提供订单号确认。"
+        "若用户主动给了订单号，只在当前买家的候选订单内精确匹配定位某一单。"
         "返回订单号、商品名、订单状态、物流状态"
         "（未发货/已发货/已揽收/运输中/派送中/已签收）、物流公司及运单号。"
     ),
@@ -290,6 +320,20 @@ def _match_orders(orders, sn):
             or (oseq and oseq in sn_clean)
         ):
             matched.append(o)
+    return matched
+
+
+def _match_douyin_order_sn(orders, sn):
+    """抖音订单号精确匹配；只允许在本买家候选订单集合内使用。"""
+    sn_clean = str(sn or "").strip()
+    if not sn_clean:
+        return []
+    matched = []
+    for order in orders:
+        order_sn = str(order.get("order_sn") or "").strip()
+        sequence = str(order.get("order_sequence_no") or "").strip()
+        if sn_clean == order_sn or (sequence and sn_clean == sequence):
+            matched.append(order)
     return matched
 
 

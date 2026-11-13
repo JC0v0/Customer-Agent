@@ -228,15 +228,23 @@ def decode_inbound(raw: bytes) -> Optional[Dict[str, Any]]:
 class PigeonTransport:
     """持久 WS 传输：接收推送 + 发送文本。"""
 
-    _instance: Optional["PigeonTransport"] = None
+    _instances: Dict[str, "PigeonTransport"] = {}
 
     @classmethod
-    def instance(cls) -> Optional["PigeonTransport"]:
-        return cls._instance
+    def instance(cls, account_key: Optional[str] = None) -> Optional["PigeonTransport"]:
+        if account_key is None:
+            return None
+        return cls._instances.get(str(account_key))
 
     @classmethod
-    def set_instance(cls, t: Optional["PigeonTransport"]):
-        cls._instance = t
+    def set_instance(cls, t: Optional["PigeonTransport"], account_key: Optional[str] = None):
+        if account_key is None:
+            return
+        key = str(account_key)
+        if t is None:
+            cls._instances.pop(key, None)
+        else:
+            cls._instances[key] = t
 
     def __init__(self, session: PigeonSession, template_path: str):
         self.session = session
@@ -1268,8 +1276,9 @@ class PigeonTransport:
 
     def close(self):
         self._closed = True
-        if PigeonTransport._instance is self:
-            PigeonTransport._instance = None
+        for key, value in list(PigeonTransport._instances.items()):
+            if value is self:
+                PigeonTransport._instances.pop(key, None)
         loop = self._loop
         if loop and loop.is_running():
             try:

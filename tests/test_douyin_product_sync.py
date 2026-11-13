@@ -20,7 +20,7 @@ def test_default_product_sync_keeps_pinduoduo_manager():
     with mock.patch(
         "Channel.douyin.utils.API.product_manager.ProductManager"
     ) as douyin_manager, mock.patch(
-        "Channel.pinduoduo.utils.API.product_manager.ProductManager"
+        "database.product_sync.ProductManager"
     ) as pdd_manager:
         _get_product_manager("pinduoduo", "123", "account_1")
 

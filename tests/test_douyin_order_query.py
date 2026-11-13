@@ -279,6 +279,61 @@ class TestQueryOrderStatusDouyin(unittest.TestCase):
         self.assertNotIn("暂未接入", result)
         self.assertNotIn("暂不支持", result)
 
+    def test_nickname_only_does_not_return_order_details(self):
+        """昵称重名风险：没有订单号时不能直接返回昵称命中的订单详情。"""
+        params = self._make_params(recipient_nick="买家甲")
+        candidate = _make_order(order_sn="123456789012345678")
+        with mock.patch(
+            "Channel.douyin.utils.API.order_query.OrderQuery.get_recent_orders",
+            return_value={"success": True, "total": 0, "orders": []},
+        ), mock.patch(
+            "Channel.douyin.utils.API.order_query.OrderQuery.get_buyer_orders",
+            return_value={"success": True, "total": 1, "orders": [candidate]},
+        ):
+            result = query_order_status(params)
+
+        self.assertNotIn("[untrusted_order_data]", result)
+        self.assertNotIn("123456789012345678", result)
+        self.assertIn("订单号", result)
+
+    def test_order_sn_must_match_buyer_candidates(self):
+        """买家报的订单号只能在自己的候选订单里匹配，不能直接查全店。"""
+        params = self._make_params(
+            recipient_nick="买家甲",
+            order_sn="999999999999999999",
+        )
+        with mock.patch(
+            "Channel.douyin.utils.API.order_query.OrderQuery.get_recent_orders",
+            return_value={"success": True, "total": 0, "orders": []},
+        ), mock.patch(
+            "Channel.douyin.utils.API.order_query.OrderQuery.get_buyer_orders",
+            return_value={"success": True, "total": 1, "orders": [
+                _make_order(order_sn="123456789012345678")
+            ]},
+        ), mock.patch(
+            "Channel.douyin.utils.API.order_query.OrderQuery.get_order_detail"
+        ) as get_detail:
+            result = query_order_status(params)
+
+        get_detail.assert_not_called()
+        self.assertIn("没找到订单号", result)
+        self.assertNotIn("[untrusted_order_data]", result)
+
+    def test_refunded_orders_are_not_shown(self):
+        """已退款/已关闭订单不应继续展示给买家。"""
+        params = self._make_params()
+        refunded = _make_order(order_sn="123456789012345678")
+        refunded["needs_shipping"] = False
+        refunded["refund_status_desc"] = "已退款"
+        with mock.patch(
+            "Channel.douyin.utils.API.order_query.OrderQuery.get_recent_orders",
+            return_value={"success": True, "total": 1, "orders": [refunded]},
+        ):
+            result = query_order_status(params)
+
+        self.assertNotIn("123456789012345678", result)
+        self.assertIn("暂无有效在途订单", result)
+
 
 if __name__ == "__main__":
     unittest.main()

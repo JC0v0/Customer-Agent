@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 from websockets.sync.client import connect
 
 from utils.logger_loguru import get_logger
-from utils.runtime_path import get_data_path, get_temp_path
+from utils.runtime_path import get_data_path
 
 logger = get_logger("DouyinProductSource")
 
@@ -115,7 +115,13 @@ class DouyinProductSource:
         不注入登录态，页面会停在登录页，等不到 /product/tproduct/list 响应，
         最终 45 秒超时。凭据统一取 temp/dy_session_live.json（登录时写入）。
         """
-        session_path = get_temp_path("dy_session_live.json")
+        from database import db_manager
+        from Channel.douyin.session_paths import existing_pigeon_session_path
+
+        account = db_manager.get_account("douyin", self.shop_id, self.user_id) or {}
+        session_path = existing_pigeon_session_path(
+            self.shop_id, self.user_id, account.get("username", "")
+        )
         if not session_path.exists():
             return 0
         try:

@@ -29,15 +29,19 @@ from utils.logger_loguru import get_logger
 # _process_pigeon_event 硬编码 "pigeon_" + conv_id[-6:] 占位昵称，导致订单
 # 昵称反查在生产路径永远查不到订单。这里从飞鸽会话列表（msgList 的
 # ext/nickname 是买家真实昵称）解析并缓存，失败时退回占位昵称不阻塞消息处理。
-_NICK_CACHE: dict = {}          # conv_id -> {"nick": str, "ts": float}
+_NICK_CACHE: dict = {}          # (shop_id, user_id, conv_id) -> {"nick": str, "ts": float}
 _NICK_TTL_SECONDS = 600.0       # 昵称缓存 10 分钟（买家改昵称低频）
 _NICK_FETCH_MIN_INTERVAL = 30.0 # 同一会话两次拉取的最小间隔（限频防刷）
 
 
-def _get_cached_nickname(conv_id: str):
+def _nick_cache_key(shop_id: str, user_id: str, conv_id: str):
+    return (str(shop_id or ""), str(user_id or ""), str(conv_id or ""))
+
+
+def _get_cached_nickname(key):
     """读昵称缓存，未过期且有值时返回昵称，否则 None。"""
     import time as _time
-    entry = _NICK_CACHE.get(conv_id)
+    entry = _NICK_CACHE.get(key)
     if entry is None:
         return None
     if _time.time() - entry["ts"] > _NICK_TTL_SECONDS:
@@ -46,7 +50,7 @@ def _get_cached_nickname(conv_id: str):
     return nick or None
 
 
-def _fetch_buyer_nickname(conv_id: str) -> str:
+def _fetch_buyer_nickname(conv_id: str, shop_id: str, user_id: str, username: str) -> str:
     """从飞鸽会话列表解析买家真实昵称（同步阻塞，调用方放 to_thread）。
 
     查找顺序：内存缓存 → 会话列表接口（msgList 中买家消息的
@@ -54,12 +58,13 @@ def _fetch_buyer_nickname(conv_id: str) -> str:
     拉取失败/找不到时返回空串；限频避免每条消息都拉一次列表。
     """
     import time as _time
-    cached = _get_cached_nickname(conv_id)
+    key = _nick_cache_key(shop_id, user_id, conv_id)
+    cached = _get_cached_nickname(key)
     if cached:
         return cached
 
     now = _time.time()
-    last_fetch = _NICK_CACHE.get(conv_id, {}).get("ts") or 0.0
+    last_fetch = _NICK_CACHE.get(key, {}).get("ts") or 0.0
     if now - last_fetch < _NICK_FETCH_MIN_INTERVAL:
         # 刚拉过但没拿到（买家还没在会话里发过消息），限频内直接放弃
         return ""
@@ -67,16 +72,17 @@ def _fetch_buyer_nickname(conv_id: str) -> str:
     try:
         from tools.reverse_probe.douyin.pigeon_conv_list import PigeonConvList
         from Channel.douyin.utils.API.order_query import extract_buyer_nick_from_ext
-        from Channel.douyin.core.douyin_lifecycle import PIGEON_SESSION_PATH
+        from Channel.douyin.session_paths import existing_pigeon_session_path
 
-        conv_list = PigeonConvList(PIGEON_SESSION_PATH)
+        session_path = existing_pigeon_session_path(shop_id, user_id, username)
+        conv_list = PigeonConvList(str(session_path))
         convs = conv_list.fetch_conversations() or []
     except Exception as exc:
         get_logger("DouyinNick").warning(
             f"会话列表拉取失败，昵称反查降级为占位: conv={conv_id}, "
             f"error_type={type(exc).__name__}"
         )
-        _NICK_CACHE[conv_id] = {"nick": "", "ts": now}
+        _NICK_CACHE[key] = {"nick": "", "ts": now}
         return ""
 
     nick = ""
@@ -97,7 +103,7 @@ def _fetch_buyer_nickname(conv_id: str) -> str:
                 break
         break
 
-    _NICK_CACHE[conv_id] = {"nick": nick, "ts": now}
+    _NICK_CACHE[key] = {"nick": nick, "ts": now}
     if nick:
         get_logger("DouyinNick").info(
             f"买家真实昵称解析成功: conv={conv_id}, nick={nick!r}"
@@ -301,7 +307,9 @@ class MessageHandlerMixin:
                 return
             # 买家真实昵称（订单昵称反查的关联键，见 ORDER_API.md §3.1）。
             # 解析失败时退回占位昵称，不阻塞消息处理。
-            buyer_nick = await asyncio.to_thread(_fetch_buyer_nickname, conv_id)
+            buyer_nick = await asyncio.to_thread(
+                _fetch_buyer_nickname, conv_id, shop_id, user_id, username
+            )
             if not buyer_nick:
                 buyer_nick = "pigeon_" + conv_id[-6:]
             msg_dict = {

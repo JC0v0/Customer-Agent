@@ -43,6 +43,10 @@ class SendMessage(BaseRequest):
             self.logger.error(f"无法在数据库中找到账户: shop_id={shop_id}, user_id={user_id}")
             raise ValueError("找不到指定的账户信息")
 
+    def _transport_key(self) -> str:
+        from bridge.context import make_account_key
+        return make_account_key(self.channel_name, self.shop_id, self.user_id)
+
     def _degraded_not_implemented(self, method_name: str) -> None:
         self.logger.warning(
             f"{method_name} 暂不支持: 降级返回空结果"
@@ -66,7 +70,7 @@ class SendMessage(BaseRequest):
         try:
             from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
             from Channel.douyin.message_rules import record_self_sent, clear_self_sent
-            pt = PigeonTransport.instance()
+            pt = PigeonTransport.instance(self._transport_key())
             if pt is not None:
                 # 预登记回声指纹（发送前，不是发送成功后）。
                 #
@@ -169,7 +173,7 @@ class SendMessage(BaseRequest):
         # 路径1：pigeon 纯协议（未来逆向后 PigeonTransport 添加 send_image 方法即自动启用）
         try:
             from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
-            pt = PigeonTransport.instance()
+            pt = PigeonTransport.instance(self._transport_key())
             if pt is not None and hasattr(pt, "send_image") and callable(pt.send_image):
                 result = pt.send_image(recipient_uid, image_url, width=width, height=height)
                 if result:
@@ -238,7 +242,7 @@ class SendMessage(BaseRequest):
         # 路径1：pigeon 纯协议
         try:
             from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
-            pt = PigeonTransport.instance()
+            pt = PigeonTransport.instance(self._transport_key())
             if pt is not None and hasattr(pt, "send_mallGoodsCard") and callable(pt.send_mallGoodsCard):
                 result = pt.send_mallGoodsCard(recipient_uid, goods_id, biz_type=biz_type)
                 if result is not None:
@@ -425,7 +429,7 @@ class SendMessage(BaseRequest):
         # 路径1：pigeon 纯协议
         try:
             from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
-            pt = PigeonTransport.instance()
+            pt = PigeonTransport.instance(self._transport_key())
             if pt is not None and hasattr(pt, "move_conversation") and callable(pt.move_conversation):
                 result = pt.move_conversation(recipient_uid, cs_uid)
                 if result is not None:

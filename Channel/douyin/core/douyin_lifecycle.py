@@ -26,9 +26,9 @@ from bridge.context import (
     make_queue_name,
 )
 from core.session_state import SessionState
+from Channel.douyin.session_paths import existing_pigeon_session_path
 
-# 会话凭据 / 发送帧模板路径（统一走运行时临时目录，兼容打包环境）
-PIGEON_SESSION_PATH = str(get_temp_path("dy_session_live.json"))
+# 发送帧 / 接收请求模板路径（统一走运行时临时目录，兼容打包环境）
 PIGEON_TEMPLATE_PATH = str(get_temp_path("dy_send_capture.json"))
 # 接收用的请求模板（v3 get_user_message 的 protobuf body 抓包）。
 # 与发送模板是两份不同的抓包，不能共用：发送帧是 WS 帧，接收是 HTTP body。
@@ -187,7 +187,7 @@ class LifecycleMixin:
 
         传输层优先级：
           1. pigeon 纯协议（方案B，与拼多多同构）：当 use_pigeon=True 或
-             存在会话凭据快照 dy_session_live.json 时使用。WS protobuf 收发，
+             存在该账号的会话凭据快照时使用。WS protobuf 收发，
              会话凭据(token+pigeon_sign)浏览器抓取一次复用。
           2. 浏览器桥（方案A，兜底）：use_bridge=True 时使用，DOM 收发。
         """
@@ -195,7 +195,9 @@ class LifecycleMixin:
 
         use_pigeon = getattr(self, "use_pigeon", None)
         if use_pigeon is None:
-            use_pigeon = os.path.exists(PIGEON_SESSION_PATH)
+            use_pigeon = existing_pigeon_session_path(
+                shop_id, user_id, username
+            ).exists()
         if use_pigeon:
             # pigeon 优先；浏览器桥仅在调用方显式开启时才作为兼容兜底。
             connected = await self._pigeon_connect(shop_id, user_id, username, on_success, on_failure)
@@ -490,7 +492,7 @@ class LifecycleMixin:
     async def _pigeon_connect(self, shop_id: str, user_id: str, username: str, on_success: callable, on_failure: callable) -> bool:
         """pigeon 纯协议连接（方案B，与拼多多同构）。成功返回 True 并调用 on_success。
 
-        读取会话凭据快照(dy_session_live.json) + 发送帧模板(dy_send_capture.json)，
+        读取该账号的会话凭据快照 + 发送帧模板(dy_send_capture.json)，
         建立持久 WS 连接。失败返回 False（不调用 on_failure，由调用方决定回退桥）。
         """
         from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport, PigeonSession
@@ -499,7 +501,8 @@ class LifecycleMixin:
             queue_name = make_queue_name(ChannelType.DOUYIN, shop_id, user_id)
             await self._setup_message_consumer(queue_name, shop_id, user_id)
 
-            if not os.path.exists(PIGEON_SESSION_PATH):
+            session_path = existing_pigeon_session_path(shop_id, user_id, username)
+            if not session_path.exists():
                 self.status_manager.update_status(
                     shop_id, user_id, username, ConnectionState.ERROR, "no_pigeon_session"
                 )
@@ -509,7 +512,7 @@ class LifecycleMixin:
                 return False
 
             transport = PigeonTransport(
-                PigeonSession.from_json(PIGEON_SESSION_PATH), PIGEON_TEMPLATE_PATH
+                PigeonSession.from_json(str(session_path)), PIGEON_TEMPLATE_PATH
             )
             try:
                 ok = await asyncio.to_thread(transport.connect, 15)
@@ -529,7 +532,8 @@ class LifecycleMixin:
                 transport.close()
                 return False
 
-            PigeonTransport.set_instance(transport)
+            account_key = make_account_key(ChannelType.DOUYIN, shop_id, user_id)
+            PigeonTransport.set_instance(transport, account_key)
             self.pigeon_transport = transport
             self.status_manager.update_status(
                 shop_id, user_id, username, ConnectionState.CONNECTED
@@ -550,7 +554,8 @@ class LifecycleMixin:
         """pigeon 消息循环等待（连接成功后调用，阻塞直到停止）。"""
         from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
 
-        transport = PigeonTransport.instance()
+        account_key = make_account_key(ChannelType.DOUYIN, shop_id, user_id)
+        transport = PigeonTransport.instance(account_key)
         if transport is None:
             self.logger.error(f"传输实例缺失，无法进入消息循环: {shop_id}-{username}")
             return
@@ -636,7 +641,8 @@ class LifecycleMixin:
                 pass
         _ACTIVE_PIGEON_LOOPS[loop_key] = current
 
-        transport = PigeonTransport.instance()
+        account_key = make_account_key(ChannelType.DOUYIN, shop_id, user_id)
+        transport = PigeonTransport.instance(account_key)
         http = None
         seen_msg = set()
         # WS 推「会话状态变化」时唤醒拉取循环，立刻补拉正文。
@@ -647,8 +653,9 @@ class LifecycleMixin:
         # 列表里（真机实测 total=0），但买家仍会继续往这个会话发消息，
         # 表现就是「发了消息程序毫无反应」。v3 按时间线拉，不看会话状态。
         try:
+            session_path = existing_pigeon_session_path(shop_id, user_id, username)
             http = PigeonHttp(
-                PigeonSession.from_json(PIGEON_SESSION_PATH),
+                PigeonSession.from_json(str(session_path)),
                 PIGEON_USRMSG_TEMPLATE_PATH,
             )
         except Exception as e:
@@ -1000,7 +1007,12 @@ class LifecycleMixin:
             return False
 
         if ok:
-            self._reload_pigeon_session(transport, http)
+            self._reload_pigeon_session(
+                transport,
+                http,
+                session_path=existing_pigeon_session_path(shop_id, user_id, username),
+                account_key=make_account_key(ChannelType.DOUYIN, shop_id, user_id),
+            )
             self.logger.info(f"抖音凭据自动刷新成功，已切换到新凭据: {shop_id}-{username}")
             return True
         self.logger.error(
@@ -1009,7 +1021,7 @@ class LifecycleMixin:
         return False
 
     @staticmethod
-    def _reload_pigeon_session(transport=None, http=None):
+    def _reload_pigeon_session(transport=None, http=None, session_path=None, account_key=None):
         """把刚写入磁盘的凭据灌回正在使用的传输层与 HTTP 客户端。
 
         这两处都持有 PigeonSession 对象，不更新的话刷新完还是拿旧 sign 发。
@@ -1020,12 +1032,14 @@ class LifecycleMixin:
                 PigeonSession,
                 PigeonTransport,
             )
-            fresh = PigeonSession.from_json(PIGEON_SESSION_PATH)
+            if session_path is None:
+                return None
+            fresh = PigeonSession.from_json(str(session_path))
         except Exception:
             return None
         target = transport
-        if target is None:
-            target = PigeonTransport.instance()
+        if target is None and account_key:
+            target = PigeonTransport.instance(account_key)
         if target is not None:
             target.session = fresh
         if http is not None:

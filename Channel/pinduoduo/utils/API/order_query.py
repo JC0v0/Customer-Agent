@@ -159,37 +159,67 @@ class OrderQuery(BaseRequest):
 
         orders = []
         for item in raw_items:
-            goods = item.get("orderGoodsList") or {}
-            # 金额单位为分
-            order_amount = item.get("orderAmount") or 0
-            buyer_nick = ""
-            if "nickname" in item:
-                buyer_nick = item.get("nickname") or ""
+            goods_items = _order_goods_items(item)
+            names = [
+                str(g.get("goodsName") or "")
+                for g in goods_items
+                if g.get("goodsName")
+            ]
+            goods_name = "、".join(names)
+            spec = str((goods_items[0].get("spec") if goods_items else "") or "")
+            try:
+                quantity = sum(
+                    int(g.get("goodsNumber") or g.get("goodsCount") or 0)
+                    for g in goods_items
+                ) or (goods_items[0].get("goodsNumber") if goods_items else 0) or 1
+            except (TypeError, ValueError):
+                quantity = (goods_items[0].get("goodsNumber") if goods_items else 0) or 1
+
+            order_status_desc = item.get("orderStatusStr") or _map_order_status(
+                item.get("orderStatus")
+            )
+            refund_status_desc = _classify_refund(order_status_desc)
+            needs_shipping = refund_status_desc not in ("已退款", "已关闭", "售后已结束")
+            tracking = str(item.get("trackingNumber") or item.get("tracking_number") or "")
             after_sales = item.get("afterSalesInfo") or {}
-            if after_sales.get("status"):
-                after_sales_status = 1
-            else:
-                after_sales_status = 0
+            order_amount = item.get("orderAmount")
+            buyer_nick = (
+                item.get("nickname")
+                or item.get("buyerNick")
+                or item.get("nickName")
+                or ""
+            )
             orders.append({
                 "order_sn": item.get("orderSn", ""),
-                "order_sequence_no": item.get("groupOrderId", ""),
-                "goods_name": goods.get("goodsName", ""),
-                "goods_id": goods.get("goodsId", ""),
-                "spec": goods.get("spec", ""),
-                "quantity": goods.get("goodsNumber") or 1,
+                "order_sequence_no": item.get("groupOrderId", "")
+                or item.get("orderSequenceNo", ""),
+                "goods_name": goods_name,
+                "goods_id": (goods_items[0].get("goodsId", "") if goods_items else ""),
+                "spec": spec,
+                "quantity": quantity,
                 "order_status": item.get("orderStatus"),
-                "order_status_desc": item.get("orderStatusStr")
-                or _map_order_status(item.get("orderStatus")),
+                "order_status_desc": order_status_desc,
+                "refund_status_desc": refund_status_desc,
+                "needs_shipping": needs_shipping,
                 "shipping_status": item.get("shippingStatus"),
-                "shipping_status_desc": _map_shipping_status(
-                    item.get("shippingStatus")
+                "shipping_status_desc": (
+                    "无需发货（已退款/已关闭）"
+                    if not needs_shipping
+                    else _map_shipping_status(item.get("shippingStatus"))
                 ),
-                "logistics_company": "",
-                "logistics_sn": item.get("trackingNumber", ""),
-                "pay_amount": round(order_amount / 100.0, 2),
+                "logistics_company": _extract_logistics_company(item),
+                "logistics_sn": tracking,
+                "pay_amount": (
+                    round(float(order_amount) / 100.0, 2)
+                    if order_amount is not None
+                    else None
+                ),
+                "order_time": item.get("orderTime") or item.get("createdAt", ""),
                 "confirm_time": item.get("confirmTime", ""),
                 "pay_time": item.get("payTime", ""),
-                "after_sales_status": after_sales_status,
+                "after_sales_status": (
+                    1 if refund_status_desc or after_sales.get("status") else 0
+                ),
                 "buyer_nick": buyer_nick,
                 "buyer_uid": str(item.get("uid") or uid),
             })
@@ -265,3 +295,60 @@ def _map_shipping_status(code):
         -1: "无需发货",
     }
     return _MAP.get(code, f"物流状态({code})")
+
+
+def _classify_refund(status_desc):
+    """从订单状态文案识别退款/关闭/售后状态。"""
+    text = str(status_desc or "")
+    if "退款成功" in text or "已退款" in text:
+        return "已退款"
+    if "退款中" in text or "退款" in text:
+        return "退款中"
+    if "售后成功" in text or "售后关闭" in text:
+        return "售后已结束"
+    if "售后中" in text or "售后" in text:
+        return "售后处理中"
+    if "已关闭" in text or "关闭" in text:
+        return "已关闭"
+    return ""
+
+
+def _order_goods_items(item):
+    """兼容 orderGoodsList 的 dict / list / 多商品映射三种形态。"""
+    goods_list = item.get("orderGoodsList") or {}
+    if isinstance(goods_list, dict):
+        values = list(goods_list.values())
+        if values and isinstance(values[0], dict):
+            return [g for g in values if isinstance(g, dict)]
+        return [goods_list] if goods_list else []
+    if isinstance(goods_list, list):
+        return [g for g in goods_list if isinstance(g, dict)]
+    return []
+
+
+def _extract_logistics_company(item):
+    """从 traceInfoList / 顶层字段提取物流公司名。"""
+    trace = item.get("traceInfoList")
+    if isinstance(trace, list):
+        for node in trace:
+            if not isinstance(node, dict):
+                continue
+            for key in (
+                "companyName",
+                "logisticsName",
+                "expressCompanyName",
+                "logisticsCompany",
+                "company",
+            ):
+                value = node.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    for key in ("logisticsCompany", "expressCompanyName", "express_delivery"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            name = value.get("name") or value.get("companyName")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return ""

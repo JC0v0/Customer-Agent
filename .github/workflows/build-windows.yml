@@ -43,6 +43,7 @@ jobs:
         run: |
           .venv\Scripts\python.exe -m compileall -q Agent Channel Message bridge core database service ui utils
           .venv\Scripts\python.exe -m unittest discover -v
+          .venv\Scripts\python.exe -m pytest -q
 
       - name: 安装 Inno Setup 6
         shell: pwsh

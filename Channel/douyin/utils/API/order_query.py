@@ -173,6 +173,22 @@ def _fen_to_yuan(v):
         return None
 
 
+def _classify_refund(status_desc):
+    """从订单状态文案识别退款/关闭/售后状态。"""
+    text = str(status_desc or "")
+    if "退款成功" in text or "已退款" in text:
+        return "已退款"
+    if "退款中" in text or "退款" in text:
+        return "退款中"
+    if "售后成功" in text or "售后关闭" in text:
+        return "售后已结束"
+    if "售后中" in text or "售后" in text:
+        return "售后处理中"
+    if "已关闭" in text or "关闭" in text:
+        return "已关闭"
+    return ""
+
+
 class OrderQuery(BaseRequest):
     """抖音订单查询器（抖店后台 searchlist 主路径，消息历史兜底）。"""
 
@@ -387,35 +403,42 @@ class OrderQuery(BaseRequest):
 
     def _extract_order_ids(self, buyer_uid=None, days=7):
         """
-        从会话消息历史里提取订单号。
+        从 Agent 会话历史里提取当前买家发过的订单号。
+
+        说明：订单工具运行在 Agent 内部，买家消息在调用模型前已经写入
+        ``agent_messages``。这里按同一套 conversation key 读取当前会话，
+        不再依赖并不存在的 CapturedMessage 表。
 
         Returns:
             List[str]: 订单号（去重、保持出现顺序）
-            None: 店铺未登记或数据库不可用
+            None: 数据库不可用
         """
         try:
+            from hashlib import sha256
+
+            from Agent.CustomerAgent.custom.session_manager import AgentMessage
+            from bridge.context import make_account_key
             from database import db_manager
-            from database.models import CapturedMessage, Shop
             from sqlalchemy import select
             from datetime import datetime, timedelta
 
-            db_shop_id = self._resolve_db_shop_id(db_manager, Shop)
-            if db_shop_id is None:
-                logger.warning(f"抖音订单查询: 店铺未登记 shop_id={self.shop_id}")
-                return None
+            buyer_uid = str(buyer_uid or "").strip()
+            if not buyer_uid:
+                return []
+
+            account_key = make_account_key("douyin", self.shop_id, self.user_id)
+            raw = f"{account_key}|customer|{buyer_uid}"
+            session_id = f"conversation_{sha256(raw.encode('utf-8')).hexdigest()}"
 
             with db_manager.Session() as session:
-                stmt = select(CapturedMessage).where(
-                    CapturedMessage.shop_id == db_shop_id
+                stmt = select(AgentMessage).where(
+                    AgentMessage.session_id == session_id,
+                    AgentMessage.role == "user",
                 )
-                if buyer_uid:
-                    stmt = stmt.where(CapturedMessage.from_uid == str(buyer_uid))
                 if days and days > 0:
                     cutoff = datetime.now() - timedelta(days=days)
-                    stmt = stmt.where(CapturedMessage.captured_at >= cutoff)
-                # 只查买家发言，客服消息里的订单号不算买家的订单
-                stmt = stmt.where(CapturedMessage.from_role == "user")
-                stmt = stmt.order_by(CapturedMessage.captured_at.desc()).limit(500)
+                    stmt = stmt.where(AgentMessage.timestamp >= cutoff)
+                stmt = stmt.order_by(AgentMessage.timestamp.desc()).limit(500)
 
                 messages = list(session.scalars(stmt))
 
@@ -527,6 +550,9 @@ class OrderQuery(BaseRequest):
             except (TypeError, ValueError):
                 status_desc = "未知状态"
 
+        refund_status_desc = _classify_refund(status_desc)
+        needs_shipping = refund_status_desc not in ("已退款", "已关闭", "售后已结束")
+
         # 地址：{province:{name}, city:{name}, town:{name}, street:{name}, detail}
         addr_parts = []
         for key in ("province", "city", "town", "street"):
@@ -548,6 +574,17 @@ class OrderQuery(BaseRequest):
             "quantity": quantity,
             "order_status": order_status,
             "order_status_desc": status_desc,
+            "refund_status_desc": refund_status_desc,
+            "needs_shipping": needs_shipping,
+            "shipping_status_desc": (
+                "无需发货（已退款/已关闭）"
+                if not needs_shipping
+                else (
+                    "已签收"
+                    if "已完成" in status_desc
+                    else ("已发货" if str(logistic.get("tracking_no") or "").strip() else "未发货")
+                )
+            ),
             # 金额单位是分，统一转成元
             "total_amount": _fen_to_yuan(row.get("total_price") or row.get("pay_amount")),
             "pay_amount": _fen_to_yuan(row.get("pay_amount")),
@@ -566,9 +603,8 @@ class OrderQuery(BaseRequest):
             "pay_type": str(row.get("pay_type_desc") or ""),
             "tracking_no": str(logistic.get("tracking_no") or ""),
             "logistics_company": str(logistic.get("company_code") or ""),
-            "after_sales_status": 0,
+            "after_sales_status": 1 if refund_status_desc else 0,
             "buyer_nick": str(row.get("user_nickname") or ""),
-            "needs_shipping": True,
             "source": "fxg.searchlist",
         }
 

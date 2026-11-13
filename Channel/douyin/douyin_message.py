@@ -190,8 +190,6 @@ class DouyinChatMessage(ChatMessage):
     def _process_message(self):
         # TODO(传输缝): 抖音真实消息帧结构未知，以下解析为与拼多多同构的占位实现。
         # 请按抖音实际消息的 response/event/cmd/type 与 message.type 子类型补全映射。
-        import json
-        self.logger.info(f"=== 抖音原始消息完整 JSON ===\n{json.dumps(self.msg, ensure_ascii=False, indent=2)}")
         self.msg_type = (
             self.msg.get("response") or
             self.msg.get("event") or
@@ -223,7 +221,7 @@ class DouyinChatMessage(ChatMessage):
                 self.user_msg_type, self.content = MessageTypeHandler.handle_transfer(self.msg)
             else:
                 self.user_msg_type = ContextType.SYSTEM_STATUS
-                self.content = f"不支持的消息类型: {user_msg_type}, 完整消息: {self.msg}"
+                self.content = f"不支持的消息类型: {user_msg_type}"
                 self.logger.warning(self.content)
         elif self.msg_type == "auth":
             self.user_msg_type, self.content = MessageTypeHandler.handle_auth(self.msg)
