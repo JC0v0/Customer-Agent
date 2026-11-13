@@ -18,6 +18,7 @@
   h = PigeonHttp(session, template_path)
   msgs = h.pull_messages(since_us)   # 返回买家文本消息列表（含游标）
 """
+import base64
 import json
 import time
 import urllib.parse
@@ -25,7 +26,8 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from .pigeon_proto import parse_fields, rebuild, get_bytes_field
+from .pigeon_proto import parse_fields, rebuild, get_bytes_field, replace_bytes_field
+from .pigeon_assets import PigeonTemplateError, load_usermsg_skeleton
 
 # 项目根目录（tools/reverse_probe/douyin/pigeon_http.py 向上四层）
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -34,6 +36,35 @@ MSG_TYPE_TEXT = 1000  # 文本消息
 MSG_TYPE_SYS = 1005   # 系统消息（超时关闭等）
 BUYER_ROLE = "Buyer"
 SHOP_ROLES = ("Shop", "CurrentServer")
+
+
+def _replace_kv(blob: bytes, field_no: int, key: str, value: str) -> bytes:
+    """替换指定层 KV 子消息里某 key 的 value；未命中时原样返回。"""
+    fields = parse_fields(blob)
+    out = []
+    changed = False
+    for f, wt, v, _ in fields:
+        if f == field_no and wt == 2:
+            kvs = parse_fields(v)
+            key_name = ""
+            for sf, swt, sv, _ in kvs:
+                if sf == 1 and swt == 2:
+                    key_name = sv.decode("utf-8", "replace")
+                    break
+            if key_name == key:
+                rebuilt = []
+                for sf, swt, sv, _ in kvs:
+                    if sf == 2 and swt == 2:
+                        rebuilt.append((sf, swt, value.encode("utf-8"), None))
+                    else:
+                        rebuilt.append((sf, swt, sv, None))
+                out.append((f, wt, rebuild(rebuilt), None))
+                changed = True
+                continue
+        out.append((f, wt, v, None))
+    if not changed:
+        return blob
+    return rebuild(out)
 
 
 class PigeonHttpError(RuntimeError):
@@ -55,14 +86,68 @@ class PigeonHttp:
 
     def __init__(self, session, template_path: str):
         self.session = session
-        t = json.load(open(template_path, encoding="utf-8"))
+        t = self._load_template(template_path)
         self.url_base = t.get("url_base") or "https://fxg.jinritemai.com/pigeon_im/v3/message/get_user_message"
-        self._body = bytearray(__import__("base64").b64decode(t["body_b64"]))
+        self._body = bytearray(base64.b64decode(t["body_b64"]))
         self.last_status: Optional[int] = None
         self.last_error: Optional[str] = None
 
+    @staticmethod
+    def _load_template(template_path: str) -> Dict[str, Any]:
+        """优先用运行时抓到的请求体，缺失时退回包内脱敏骨架。
+
+        请求体里只有 token / device_id / pigeon_sign，没有店铺信息，
+        因此骨架全店通用——三者在 ``_build_body`` 里都会换成当前账号的值。
+        """
+        path = Path(template_path) if template_path else None
+        if path is not None and path.exists():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("body_b64"):
+                    return data
+            except (OSError, ValueError):
+                pass
+
+        skeleton = load_usermsg_skeleton()
+        if skeleton is not None:
+            return skeleton
+        raise PigeonTemplateError(
+            "pigeon 接收模板不可用（运行时文件与包内骨架都缺失）: %s" % template_path
+        )
+
     # ---------- 请求构造 ----------
     def _build_body(self, start_us: int, end_us: int) -> bytes:
+        """填入当前账号凭据 + 替换时间窗口（微秒）。"""
+        body = self._fill_credentials(bytes(self._body))
+        return self._patch_time_window(body, start_us, end_us)
+
+    def _fill_credentials(self, body: bytes) -> bytes:
+        """把骨架里留空的 token / device_id / pigeon_sign 换成当前账号的值。
+
+        骨架是从别处抓包脱敏来的，这些字段是空的。不填直接用会被网关拒，
+        表现是 HTTP 401/403 而不是「没有新消息」，很容易误判成账号掉线。
+        """
+        session = self.session
+        if getattr(session, "token", ""):
+            try:
+                body = replace_bytes_field(body, 4, str(session.token).encode("utf-8"))
+            except KeyError:
+                pass
+        if getattr(session, "device_id", ""):
+            try:
+                body = replace_bytes_field(body, 9, str(session.device_id).encode("utf-8"))
+            except KeyError:
+                pass
+            body = _replace_kv(body, 15, "session_did", str(session.device_id))
+        if getattr(session, "aid", ""):
+            body = _replace_kv(body, 15, "session_aid", str(session.aid))
+        if getattr(session, "pigeon_sign", ""):
+            body = _replace_kv(body, 15, "pigeon_sign", str(session.pigeon_sign))
+        return body
+
+    @staticmethod
+    def _patch_time_window(body: bytes, start_us: int, end_us: int) -> bytes:
         """替换 body f8.f12048.f1(起始) / f4(结束) 时间戳（微秒）。"""
         def patch_12048(blob: bytes) -> bytes:
             fields = parse_fields(blob)
@@ -82,17 +167,14 @@ class PigeonHttp:
                     new.append((f, wt, v, None))
             return rebuild(new)
 
-        def patch_all(blob: bytes) -> bytes:
-            fields = parse_fields(blob)
-            new = []
-            for f, wt, v, _ in fields:
-                if f == 8 and wt == 2:
-                    new.append((f, wt, patch_12048(v), None))
-                else:
-                    new.append((f, wt, v, None))
-            return rebuild(new)
-
-        return patch_all(bytes(self._body))
+        fields = parse_fields(body)
+        new = []
+        for f, wt, v, _ in fields:
+            if f == 8 and wt == 2:
+                new.append((f, wt, patch_12048(v), None))
+            else:
+                new.append((f, wt, v, None))
+        return rebuild(new)
 
     def _post(self, body: bytes, timeout: Optional[float] = None) -> Optional[bytes]:
         if timeout is None:
@@ -240,10 +322,14 @@ class PigeonHttp:
         return out
 
     # ---------- 对外接口 ----------
-    # 服务端时间窗口过滤存在已知问题：小回溯窗口（<24h）可能返回 0 条，
-    # 即使窗口内确有消息。因此请求体始终用大回溯（REQUEST_BACKFILL_SECONDS），
-    # 客户端靠 since_us 游标做增量过滤。
-    REQUEST_BACKFILL_SECONDS = 86400  # 请求体固定回溯 24h
+    # 服务端按时间升序返回，且有条数上限：窗口开得越大，返回的越是窗口里
+    # 最早的那批，最新消息反而被截掉（真机实测回溯 24h 只返回到 23:33 的
+    # 旧消息，之后的买家消息一直收不到）。请求体窗口因此贴着客户端游标走。
+    REQUEST_BACKFILL_SECONDS = 86400  # 窗口起点最远不超过 24h
+    REQUEST_WINDOW_SECONDS = 600      # 建立基线时的窗口，覆盖平台时间戳延迟
+    REQUEST_OVERLAP_SECONDS = 60      # 窗口向游标前多留 1 分钟
+    REQUEST_MAX_PAGES = 4             # 单页被截断时最多翻几页
+    PAGE_TRUNCATE_HINT = 40           # 单页达到这个量级才判断是否被截断
 
     def pull_messages(self, since_us: int, end_us: Optional[int] = None,
                       body_since_us: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -251,34 +337,64 @@ class PigeonHttp:
 
         Args:
             since_us: 客户端过滤游标（只返回 since_us < ts <= end_us 的消息）
-            end_us: 客户端过滤结束时间（默认 now+60s）
-            body_since_us: 请求体起始时间戳（默认 now-24h）。
-                服务端小窗口可能返回 0 条，故固定用大回溯，客户端做增量过滤。
+            end_us: 客户端过滤结束时间（默认 now+5min）
+            body_since_us: 请求体起始时间戳。默认贴着 since_us 前留 1 分钟；
+                since_us 为 0（建立基线）时用 now-10min。窗口不能开大：
+                服务端升序返回且有条数上限，窗口大了新消息会被截掉。
         """
+        now_us = int(time.time() * 1e6)
         if end_us is None:
             # 抓包里 origin_timestamp_offset 可达 200 秒，说明消息 ts 可能来自
             # 买家客户端、与本机时钟有偏差。窗口上界放到 now+5min，避免
             # 「时间戳比本机快」的消息被 <= end_us 过滤掉而永远收不到。
-            end_us = int(time.time() * 1e6) + int(300 * 1e6)
+            end_us = now_us + int(300 * 1e6)
         if body_since_us is None:
-            body_since_us = int(time.time() * 1e6) - int(self.REQUEST_BACKFILL_SECONDS * 1e6)
-        body = self._build_body(body_since_us, end_us)
-        rb = self._post(body)
-        if rb is None:
-            raise PigeonHttpError(
-                "get_user_message 请求失败: status=%s err=%s"
-                % (self.last_status, self.last_error)
+            if since_us > 0:
+                body_since_us = since_us - int(self.REQUEST_OVERLAP_SECONDS * 1e6)
+            else:
+                body_since_us = now_us - int(self.REQUEST_WINDOW_SECONDS * 1e6)
+            floor_us = now_us - int(self.REQUEST_BACKFILL_SECONDS * 1e6)
+            if body_since_us < floor_us:
+                body_since_us = floor_us
+
+        messages = []
+        cursor = body_since_us
+        for _ in range(self.REQUEST_MAX_PAGES):
+            body = self._build_body(cursor, end_us)
+            rb = self._post(body)
+            if rb is None:
+                raise PigeonHttpError(
+                    "get_user_message 请求失败: status=%s err=%s"
+                    % (self.last_status, self.last_error)
+                )
+            if not rb:
+                break
+            page = [
+                message
+                for message in self._decode_response(rb)
+                if isinstance(message.get("ts"), int)
+            ]
+            if not page:
+                break
+            messages.extend(page)
+            newest = max(message["ts"] for message in page)
+            # 没返回到窗口末端，说明这一页被条数上限截断了：拿本页最新时间戳
+            # 做下一页起点，直到追上窗口末端。
+            truncated = (
+                len(page) >= self.PAGE_TRUNCATE_HINT
+                and newest < end_us - int(300 * 1e6)
             )
-        if not rb:
-            return []
+            if not truncated or newest <= cursor:
+                break
+            cursor = newest
+
         # 服务端有时会把整段历史一起返回，不能只相信请求体中的时间窗。
         # 若把已关闭会话的历史消息交给自动回复，飞鸽会 ACK 发送却静默丢弃，
         # 造成"日志成功、手机未收到"的假象。
         return [
             message
-            for message in self._decode_response(rb)
-            if isinstance(message.get("ts"), int)
-            and since_us < message["ts"] <= end_us
+            for message in messages
+            if since_us < message["ts"] <= end_us
         ]
 
     def pull_buyer_messages(self, since_us: int) -> List[Dict[str, Any]]:

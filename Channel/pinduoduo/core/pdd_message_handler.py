@@ -70,7 +70,8 @@ class MessageHandlerMixin:
             message_data = json.loads(message)
             msg_type = message_data.get("message", {}).get("type", "unknown")
             self.logger.debug(
-                f"received message: type={msg_type}, shop_id={shop_id}"
+                f"received message: channel=pinduoduo, type={msg_type}, "
+                f"shop_id={shop_id}"
             )
 
             pdd_message = PDDChatMessage(message_data)

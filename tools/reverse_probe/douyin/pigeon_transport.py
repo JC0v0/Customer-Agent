@@ -22,10 +22,22 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from .pigeon_proto import parse_fields, get_bytes_field, rebuild, replace_bytes_field, enc_bytes_field
+from .pigeon_assets import (
+    REGISTER_CMD,
+    PigeonTemplateError,
+    is_handshake_cmd,
+    load_enter_skeleton_frame,
+    load_send_skeleton_frame,
+    load_start_skeleton_frame,
+    read_capture_frames,
+)
 
 # 角色常量（依据抓包：发送帧 sender_role=2 为商家；3 为买家/服务端事件）
 MERCHANT_ROLE = "2"
 BUYER_ROLE = "3"
+# 正文帧命令号的兜底值。真实编号随客户端版本变（10018 → 10019 → 10022），
+# 所以正常路径按载荷结构认帧（见 _pick_text_frame），只有认不出时才用它。
+TEXT_FRAME_CMD = 10019
 
 
 def _cmd_of(raw: bytes):
@@ -35,6 +47,106 @@ def _cmd_of(raw: bytes):
         return next((v for f, wt, v, _ in fs if f == 1 and wt == 0), None)
     except Exception:
         return None
+
+
+def _inner_field(raw: bytes, number: int):
+    """取 f8.f8 里的第 number 号子字段（业务载荷都挂在这层）。"""
+    try:
+        f8 = get_bytes_field(raw, 8)
+        inner = get_bytes_field(f8, 8) if f8 else None
+        if not inner:
+            return None
+        return get_bytes_field(inner, number)
+    except Exception:
+        return None
+
+
+def _has_business_payload(raw: bytes) -> bool:
+    """帧里有没有业务载荷（f8.f8.f100 的 kvmap）。
+
+    同一条连接上，「同步会话列表」之类的空壳帧和真正的业务帧用的是同一个
+    命令号区间，登录页面加载时就能录到 10018（长度 1.5K、没有业务载荷）。
+    那种帧当模板用会发出空包，服务端直接丢。只有带 kvmap 的才是真业务帧。
+    """
+    payload = _inner_field(raw, 100)
+    if not payload:
+        return False
+    try:
+        return bool(_kvmap(payload))
+    except Exception:
+        return False
+
+
+def _pick_text_frame(by_cmd):
+    """从录到的帧里挑出「正文发送帧」，按载荷结构认，不按命令号认。
+
+    客户端每次升级都会给正文帧换编号（抓包见过 10018/10019/10022），但载荷
+    一直是 f8.f8.f100，里面同时挂着四样东西：正文(f4)、会话票据(f7)、子会话
+    短 ID(f14)、买家 ID(f50)。会话列表之类的空壳帧虽然共用同一段编号，却没有
+    这组字段，按结构认就不会挑错。
+    """
+    cmds = []
+    for cmd in by_cmd:
+        cmds.append(cmd)
+    cmds.sort(reverse=True)
+    for cmd in cmds:
+        raw = by_cmd[cmd]
+        payload = _inner_field(raw, 100)
+        if not payload:
+            continue
+        try:
+            fields = parse_fields(payload)
+        except Exception:
+            continue
+        has_text = False
+        has_ticket = False
+        has_talk = False
+        for f, wt, v, _ in fields:
+            if f == 4 and wt == 2 and len(v) > 0:
+                has_text = True
+            if f == 7 and wt == 2 and len(v) > 40:
+                has_ticket = True
+            if f == 14 and wt == 0:
+                has_talk = True
+        if has_text and has_ticket and has_talk:
+            return cmd, raw
+    return None, None
+
+
+def _pick_enter_frame(by_cmd):
+    """从录到的帧里挑出「进会话帧」，按载荷结构认，不按命令号认。
+
+    结构是 f8.f8.f610，其中 f610.f1 是会话包装：f2 = 会话号（19 位），
+    f20 = 买家安全 ID。服务端收到它才回「该会话的票据 + 会话短 ID」。
+    实测同一份客户端里 10014 这个编号可能落在心跳帧上，所以必须按结构认。
+    """
+    cmds = []
+    for cmd in by_cmd:
+        cmds.append(cmd)
+    cmds.sort(reverse=True)
+    for cmd in cmds:
+        raw = by_cmd[cmd]
+        payload = _inner_field(raw, 610)
+        if not payload:
+            continue
+        wrapper = get_bytes_field(payload, 1)
+        if not wrapper:
+            continue
+        try:
+            fields = parse_fields(wrapper)
+        except Exception:
+            continue
+        has_conv = False
+        has_buyer = False
+        for f, wt, v, _ in fields:
+            if f == 2 and wt == 0 and int(v) > 10 ** 15:
+                has_conv = True
+            if f == 20 and wt == 2 and len(v) >= 40:
+                has_buyer = True
+        # 两个字段都在才是进会话帧：只有会话号的可能是会话列表类的请求。
+        if has_conv and has_buyer:
+            return cmd, raw
+    return None, None
 
 # 默认 WS 端点
 WS_URL_TMPL = ("wss://ws.fxg.jinritemai.com/ws/v2?"
@@ -210,7 +322,7 @@ def decode_inbound(raw: bytes) -> Optional[Dict[str, Any]]:
             "security_sender_id": kv.get("security_sender_id", "") or kv.get("security_pigeon_uid", ""),
             "shop_id": kv.get("shop_id", ""),
             "talk_id": kv.get("talk_id", ""),
-            "sender_role": kv.get("sender_role", ""),
+            "sender_role": kv.get("sender_role", "") or kv.get("im_sender_role", ""),
             # 来源判定字段：飞鸽用 s:sender_biz_role 标 Buyer / Shop / CurrentServer，
             # 平台机器人提示还会带 systemHint / biz_sender。缺了这几个字段，WS
             # 链路就无法区分「买家发言」和「平台提示」，会把系统消息交给 AI。
@@ -255,6 +367,8 @@ class PigeonTransport:
         self._queue = asyncio.Queue()
         self._loop = None
         self._closed = False
+        # 握手帧被服务端应答的条数（0 = 握手没被认，多半是协议又改版了）
+        self.handshake_replied = 0
         # conv_id -> {"security_receiver_id":..., "shop_id":...}
         self.conv_state: Dict[str, Dict[str, str]] = {}
         # 发送 ACK 等待（与 poll 的 queue 隔离，避免 poll 抢走 ACK）
@@ -270,6 +384,15 @@ class PigeonTransport:
         # 「人工客服XX为您服务」欢迎语，它和我们的回声同角色、先后到达。
         # 只留最后一个 payload 会被这条例外覆盖，导致误判 text_no_echo。
         self._echo_texts: List[str] = []
+        # conv_id -> (ticket, short_id, 取票时刻)。票据由 10014 按目标会话下发，
+        # 寿命约 11 分钟，这里按 5 分钟缓存，过期重新进会话取票。
+        self._ticket_cache: Dict[str, tuple] = {}
+        # 进会话帧模板（取票据用）由上面的 _load_templates 填充，这里只补默认值，
+        # 不能写成 self._enter_template = None，否则会把刚加载的模板冲掉。
+        if not hasattr(self, "_enter_template"):
+            self._enter_template = None
+        if not hasattr(self, "_enter_cmd"):
+            self._enter_cmd = 10014
 
     def is_connected(self) -> bool:
         """Return whether the underlying websocket is still usable.
@@ -289,20 +412,135 @@ class PigeonTransport:
         return self.conv_state.get(str(conv_id), {})
 
     def _load_templates(self, template_path):
-        d = json.load(open(template_path, encoding="utf-8"))
-        frames = [__import__("base64").b64decode(f["b64"]) for f in d["ws_sent"] if "b64" in f]
-        self._frames_by_cmd = {cmd: frame for frame in frames if (cmd := _cmd_of(frame))}
-        self._handshake = frames[0:2]      # 10008 / 10009
-        self._send_tmpl = frames[8]        # 10018 发送帧模板
-        # 10011 注册帧（含 shop_id，让服务端把连接归属到店铺；缺它收不到任何推送）
-        self._register = next((f for f in frames if _cmd_of(f) == 10011), None)
-        self._send_tmpl = self._frames_by_cmd.get(10018)
-        # 10013 打开会话帧：发送前必须针对当前会话补发，否则已关闭会话会 ACK
-        # 但不会实际投递到买家端。
-        self._open_conversation = next((f for f in frames if _cmd_of(f) == 10013), None)
-        self._start_conversation = self._frames_by_cmd.get(10016)
+        """加载 WS 帧模板：运行时抓包优先，发送序列可用包内骨架兜底。
+
+        登录时 Playwright 会监听 WebSocket，把握手 / 注册帧录成
+        ``dy_send_capture*.json``。但发送序列（10016 开会话、10018 正文）
+        只有「真的发一条消息」才会产生，登录浏览时不会有，所以缺它们时用
+        包内脱敏骨架补——骨架里没有凭据，发送前会被
+        ``_rebuild_message_frame`` 整体重建。
+
+        2026-11-13 真机：只给 10018 兜底、漏了 10016，新客户登录后第一次
+        回复直接报 ``missing_start_template``（连接正常、能收消息、发不出去）。
+        """
+        frames = read_capture_frames(template_path)
+
+        by_cmd: Dict[int, bytes] = {}
+        ordered: List[bytes] = []
+        for frame in frames:
+            cmd = _cmd_of(frame)
+            if cmd is None:
+                continue
+            by_cmd[cmd] = frame
+            ordered.append(frame)
+
+        # 握手/认证帧：命令号小于注册帧的那些，按抓包里的原始顺序发。
+        # 不写死帧号——客户端改版会换号（10008/10009 → 10010 → 10005/10006）。
+        handshake: List[bytes] = []
+        for frame in ordered:
+            if is_handshake_cmd(_cmd_of(frame)):
+                handshake.append(frame)
+        register = by_cmd.get(REGISTER_CMD)
+
+        # 兜底：万一哪天连「10011 是注册帧」这条规则也被改掉（握手帧号全
+        # 挪到 10011 之后），按录制顺序取前两帧当握手——浏览器新建连接时
+        # 头两帧必然是认证握手，位置比编号稳定。
+        if not handshake and ordered:
+            handshake = ordered[:2]
+
+        # 发送模板：命令号随客户端版本变，先按载荷结构认帧；认不出再用录帧里
+        # 的兜底编号，仍没有就用包内骨架。空壳帧（没有业务载荷）不能直接用，
+        # 否则发出去是空包。
+        send_cmd, send_tmpl = _pick_text_frame(by_cmd)
+        if send_tmpl is None:
+            fallback = by_cmd.get(TEXT_FRAME_CMD)
+            if fallback is not None and _has_business_payload(fallback):
+                send_cmd = TEXT_FRAME_CMD
+                send_tmpl = fallback
+        used_skeleton = False
+        if send_tmpl is None:
+            skeleton = load_send_skeleton_frame()
+            if skeleton is not None:
+                send_tmpl = skeleton
+                send_cmd = _cmd_of(skeleton) or TEXT_FRAME_CMD
+                used_skeleton = True
+        self._text_cmd = send_cmd
+        # 供上层日志判断：用的是真实发送帧还是脱敏骨架
+        self.used_send_skeleton = used_skeleton
+
+        start_tmpl = by_cmd.get(10016)
+        if start_tmpl is not None and not _has_business_payload(start_tmpl):
+            start_tmpl = None
+        used_start_skeleton = False
+        if start_tmpl is None:
+            start_skeleton = load_start_skeleton_frame()
+            if start_skeleton is not None:
+                start_tmpl = start_skeleton
+                used_start_skeleton = True
+        self.used_start_skeleton = used_start_skeleton
+
+        # 进会话帧（取票据用）：结构上 inner 里有 f610，且 f610.f1.f2 是会话号。
+        # 命令号不可靠——2026-11-14 实测同一个客户端，登录抓包里这个位置的
+        # 「10014」只是一帧 5 字节心跳，真正的进会话帧在 10012/10013 上。
+        enter_cmd, enter_tmpl = _pick_enter_frame(by_cmd)
+        used_enter_skeleton = False
+        if enter_tmpl is None:
+            enter_skeleton = load_enter_skeleton_frame()
+            if enter_skeleton is not None:
+                enter_tmpl = enter_skeleton
+                enter_cmd = _cmd_of(enter_skeleton) or 10014
+                used_enter_skeleton = True
+        self._enter_cmd = enter_cmd or 10014
+        self.used_enter_skeleton = used_enter_skeleton
+
+        missing: List[str] = []
+        # 注册帧(10011)降级为可选——消息正文本就走 HTTP 拉取
+        # （PIGEON_PULL_INTERVAL 0.4s），WS 只推会话状态，缺注册帧不影响收发。
+        if not handshake and register is None:
+            missing.append("握手/认证帧(命令号小于 %d)" % REGISTER_CMD)
+        if send_tmpl is None:
+            missing.append("发送帧")
+        if start_tmpl is None:
+            missing.append("开会话帧(10016)")
+        if missing:
+            raise PigeonTemplateError(
+                "pigeon 模板不完整，缺少 %s（模板文件: %s）。"
+                "请重新登录该抖音账号，登录流程会自动采集。" % (
+                    "、".join(missing), template_path)
+            )
+
+        # 10013 打开会话帧：载荷在 f8.f8.f2000（会话号），空壳帧不能用。
+        open_tmpl = by_cmd.get(10013)
+        if open_tmpl is not None and not _inner_field(open_tmpl, 2000):
+            open_tmpl = None
+
+        self._frames_by_cmd = by_cmd
+        # 重建帧时统一从 _frames_by_cmd 取模板，所以把最终选定的模板写回它
+        # 自己的命令号下：录帧里的空壳帧被骨架替换后，_rebuild_message_frame
+        # 才能拿到真模板。
+        if send_tmpl is not None and send_cmd is not None:
+            self._frames_by_cmd[send_cmd] = send_tmpl
+        if start_tmpl is not None:
+            self._frames_by_cmd[10016] = start_tmpl
+        # 进会话帧单独存放：登录录帧里同号帧可能是 5 字节心跳，塞进
+        # _frames_by_cmd 会把它顶掉。
+        self._enter_template = enter_tmpl
+        if open_tmpl is not None:
+            self._frames_by_cmd[10013] = open_tmpl
+        self._handshake = handshake
+        self._send_tmpl = send_tmpl
+        # 10011 注册帧（含 shop_id，让服务端把连接归属到店铺）；可选，
+        # shop_id 封在 f604 加密 blob 里与会话绑定，无法跨会话合成。
+        self._register = register
+        self._open_conversation = open_tmpl
+        self._start_conversation = start_tmpl
         # 保存模板帧自身凭据（当外部传入的 session 与模板同源时使用）
-        self._tmpl_session = self._extract_session(frames[0])
+        if handshake:
+            self._tmpl_session = self._extract_session(handshake[0])
+        elif ordered:
+            self._tmpl_session = self._extract_session(ordered[0])
+        else:
+            self._tmpl_session = {}
 
     @staticmethod
     def _load_image_send_template():
@@ -354,19 +592,37 @@ class PigeonTransport:
     async def _open(self, timeout):
         import websockets
         self._ws = await websockets.connect(self.session.ws_url(), open_timeout=timeout, max_size=None)
-        for idx in [0, 1]:
+        # 服务端对合法帧一定回包、对垃圾帧一声不响（2026-11-13 实测：发
+        # cmd=99999 无应答，发真实握手帧有应答）。用「有没有任何回包」当作
+        # 握手是否被认的探针，协议再改版也能第一时间在日志里看出来。
+        replied = 0
+        for idx in range(len(self._handshake)):
             await self._ws.send(self._refresh_session_frame(self._handshake[idx]))
             try:
                 await asyncio.wait_for(self._ws.recv(), timeout=8)
+                replied += 1
             except asyncio.TimeoutError:
                 pass
-        # 补发 10011 注册帧：让服务端把连接归属到店铺（否则不推送任何消息/状态）
+        # 补发注册帧：让服务端把连接归属到店铺（否则不推送任何消息/状态）
         if self._register:
             try:
                 await self._ws.send(self._refresh_session_frame(self._register))
                 await asyncio.wait_for(self._ws.recv(), timeout=8)
+                replied += 1
             except asyncio.TimeoutError:
                 pass
+            except Exception:
+                pass
+        self.handshake_replied = replied
+        if replied == 0:
+            try:
+                from utils.logger_loguru import get_logger
+                get_logger("Pigeon").error(
+                    "握手帧全部无应答（疑似抖音改了握手协议）：已发 %d 帧，"
+                    "命令号 %s；请重新登录该账号重新录帧"
+                    % (len(self._handshake) + (1 if self._register else 0),
+                       [_cmd_of(f) for f in self._handshake])
+                )
             except Exception:
                 pass
         self._reader_task = asyncio.ensure_future(self._read_loop())
@@ -400,7 +656,12 @@ class PigeonTransport:
                                 self._ack_conversation_short_id = ev["conversation_short_id"]
                             if self._ack_event and not self._ack_event.is_set():
                                 self._ack_event.set()
-                        if ev.get("text") and ev.get("sender_role") == MERCHANT_ROLE:
+                        # 商家侧回声：部分推送只带 s:sender_biz_role（im_sender_role 为空），
+                        # 只看 sender_role=2 会把已投递的正文判成 text_no_echo。
+                        if ev.get("text") and (
+                            ev.get("sender_role") == MERCHANT_ROLE
+                            or ev.get("sender_biz_role") in ("CurrentServer", "Shop")
+                        ):
                             self._echo_payload = ev
                             self._echo_texts.append(str(ev.get("text") or ""))
                             if len(self._echo_texts) > 30:
@@ -530,126 +791,116 @@ class PigeonTransport:
             await asyncio.sleep(0.1)
         return False
 
-    async def _send_protocol_flow(self, conv_id, text, security_receiver_id, shop_id):
-        """完整发送流程：换票据 → 开会话 → 发文本 → 收尾帧 → 等回声。
+    TICKET_TTL_SECONDS = 300.0
 
-        与图片发送 _send_image_async 保持一致，复用抓包里的浏览器帧序列。
-        只有收到商家侧回声才判定成功，避免「日志成功、买家未收到」。
+    async def _acquire_ticket(self, conv_id, security_receiver_id, shop_id, timeout=5.0):
+        """进一次目标会话（10014），把该会话的票据和会话短 ID 拿回来。
 
-        2026-11-10 真机定位：会话关闭后 10013 会返回
-        ``request.GetConversationId is error``，此时 10015 给的是服务端
-        「当前活跃会话」的短 ID（属于别的买家）。拿它去发文本会被静默丢弃，
-        表现就是 text_no_echo。会话列表里的 subConversationId 才是目标会话
-        当前的子会话 ID，因此以它为准。
+        2026-11-14 真机实证：10014 只需要替换会话号（f610.f1.f2）和买家安全
+        ID（f610.f1.f20），服务端就会在回包里下发 226 字符票据以及**这个会话**
+        的会话短 ID；换个会话号重放，回的短 ID 也跟着变。票据寿命约 11 分钟，
+        这里缓存 5 分钟，过期重新进会话。
         """
-        self._ack_event = asyncio.Event()
-        self._echo_event = asyncio.Event()
-        self._ack_payload = None
-        self._echo_payload = None
+        key = str(conv_id)
+        cached = self._ticket_cache.get(key)
+        if cached:
+            ticket, short_id, born = cached
+            if ticket and short_id and (time.monotonic() - born) < self.TICKET_TTL_SECONDS:
+                return ticket, short_id
+
+        frame = self._rebuild_enter_frame(conv_id, security_receiver_id, shop_id)
+        if not frame:
+            return "", 0
         self._ack_ticket = ""
         self._ack_conversation_short_id = 0
+        await self._ws.send(frame)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._ack_ticket and self._ack_conversation_short_id:
+                break
+            await asyncio.sleep(0.1)
+        ticket = self._ack_ticket
+        short_id = self._ack_conversation_short_id
+        if ticket and short_id:
+            self._ticket_cache[key] = (ticket, short_id, time.monotonic())
+        return ticket, short_id
+
+    async def _send_protocol_flow(self, conv_id, text, security_receiver_id, shop_id):
+        """发送正文：进一次目标会话取票 → 重建正文帧 → 发出去 → 等商家侧回声。
+
+        2026-11-14 真机实证（每次都用 HTTP 时间线核对是否真落库）：
+          1. 10014 只换会话号 + 买家安全 ID，服务端就在回包里下发**该会话**的
+             226 字符票据和会话短 ID（换个会话号，回的短 ID 也变）。
+          2. 正文帧 f8.f8.f100 带齐四样东西就能投递：会话号(f3)、票据(f7)、
+             会话短 ID(f14)、买家复合键(f50 = `<安全ID>:<shop_id>::2:1:pigeon`)。
+          3. 反例：f14 填雪花 ID、f50 只填 88 位安全 ID（缺复合后缀），都会
+             拿到 ACK OK 但消息被静默丢弃。
+        """
+        self._echo_event = asyncio.Event()
+        self._echo_payload = None
         # 每轮发送重新收集回声候选；重试阶段不再清空，避免把已到达的回声丢掉。
         self._echo_texts = []
 
         state = self.conv_state.setdefault(str(conv_id), {})
         talk_id = str(state.get("talk_id") or "")
 
-        async def send_control(command, pause=0.12):
-            frame = self._rebuild_control_frame(
-                command, conv_id, security_receiver_id, shop_id
-            )
-            if frame:
-                await self._ws.send(frame)
-            await asyncio.sleep(pause)
-
-        async def send_start_and_text(short_id):
-            start_frame = self._rebuild_start_conversation_frame(
-                conv_id, security_receiver_id, shop_id, self._ack_ticket, short_id
-            )
-            if not start_frame:
-                return "missing_start_template"
-            await self._ws.send(start_frame)
-            await asyncio.sleep(0.3)
-            # 10017：抓包序列里紧跟 10016 的会话确认帧，缺它会丢正文。
-            #
-            # 2026-11-11 01:10 真机定位：浏览器的完整发送序列是
-            #   10013 10014 10015 10016 **10017** 10018 10019 10020 10021
-            # 原实现只发了 10016 就直接 10018。会话处于正常接待状态时服务端
-            # 宽容，照样投递；一旦会话被平台智能客服接过、或超时关闭后重开，
-            # 缺 10017 的正文帧会拿到 ACK code=0 但被静默丢弃（text_no_echo）。
-            await send_control(10017, pause=0.12)
-            text_frame = self._rebuild_message_frame(
-                10018, conv_id, text, security_receiver_id, shop_id,
-                self._ack_ticket, short_id,
-            )
-            if not text_frame:
-                return "missing_text_template"
-            await self._ws.send(text_frame)
-            await asyncio.sleep(0.25)
-            for command in (10019, 10020, 10021):
-                await send_control(command, pause=0.08)
-            return ""
-
-        # 1) 换取当前会话票据与短 ID
-        for command in (10013, 10014, 10015):
-            await send_control(command)
-        deadline = time.monotonic() + 4
-        while (not self._ack_ticket or not self._ack_conversation_short_id) \
-                and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-
-        short_id = self._ack_conversation_short_id
-        short_id = self._select_conversation_short_id(
-            self._ack_conversation_short_id, talk_id
+        ticket, short_id = await self._acquire_ticket(
+            conv_id, security_receiver_id, shop_id
         )
-        if not short_id:
+        if not ticket:
+            # 没票就别发：f7 会退回模板里那个会话的旧票，服务端照样回 ACK
+            # 然后把消息静默丢弃，日志只会留下一个查不出所以然的 text_no_echo。
             self.last_send_result = {
                 "ok": False, "reason": "missing_conversation_ticket",
                 "conv_id": str(conv_id),
-                "has_ticket": bool(self._ack_ticket),
-                "has_short_id": bool(short_id),
+            }
+            return False
+        if short_id:
+            talk_id = str(short_id)
+            state["talk_id"] = talk_id
+        if not talk_id:
+            self._refresh_conv_context(conv_id)
+            state = self.conv_state.get(str(conv_id), {})
+            talk_id = str(state.get("talk_id") or "")
+
+        frame = self._rebuild_message_frame(
+            self._text_cmd, conv_id, text, security_receiver_id, shop_id,
+            ticket, talk_id,
+        )
+        if not frame:
+            self.last_send_result = {
+                "ok": False, "reason": "missing_text_template", "conv_id": str(conv_id),
             }
             return False
 
-        state["conversation_short_id"] = str(short_id)
-
-        # 2) 开启会话 + 发文本（失败时用会话列表短 ID 再试一次）
-        error = await send_start_and_text(short_id)
-        if error:
+        await self._ws.send(frame)
+        if await self._wait_text_echo(text, 8.0):
             self.last_send_result = {
-                "ok": False, "reason": error, "conv_id": str(conv_id),
-            }
-            return False
-
-        # 3) 只认商家回声（按文本匹配，不按「第一条 role=2 消息」）
-        if await self._wait_text_echo(text, 6.0):
-            self.last_send_result = {
-                "ok": True, "reason": "text_echo_confirmed",
-                "conv_id": str(conv_id), "short_id": str(short_id),
+                "ok": True, "reason": "text_echo_confirmed", "conv_id": str(conv_id),
             }
             return True
 
-        # 4) 没回声时重试一次：会话刚被激活或票据过期都会导致首帧被丢。
-        # 不清空 _echo_texts：首帧若已投递、只是回声晚到，清空会把它丢掉。
+        # 没回声时重试一次：连接刚建好时首帧偶尔被丢。
         self._echo_event = asyncio.Event()
         self._echo_payload = None
         await asyncio.sleep(0.3)
-        error = await send_start_and_text(short_id)
-        if not error:
-            if await self._wait_text_echo(text, 5.0):
-                self.last_send_result = {
-                    "ok": True, "reason": "text_echo_confirmed_retry",
-                    "conv_id": str(conv_id), "short_id": str(short_id),
-                }
-                return True
+        frame = self._rebuild_message_frame(
+            self._text_cmd, conv_id, text, security_receiver_id, shop_id,
+            ticket, talk_id,
+        )
+        if frame:
+            await self._ws.send(frame)
+        if await self._wait_text_echo(text, 6.0):
+            self.last_send_result = {
+                "ok": True, "reason": "text_echo_confirmed_retry", "conv_id": str(conv_id),
+            }
+            return True
 
+        # 两次都没回声：票据可能已经过期或不属于这个会话，丢掉缓存，下次重取。
+        self._ticket_cache.pop(str(conv_id), None)
         self.last_send_result = {
             "ok": False, "reason": "text_no_echo", "conv_id": str(conv_id),
-            "short_id": str(short_id),
             "talk_id": talk_id,
-            "ack": bool(self._ack_payload and self._ack_payload.get("code") == "0"),
-            "ack_code": (self._ack_payload or {}).get("code"),
-            "ack_msg": (self._ack_payload or {}).get("msg"),
         }
         return False
 
@@ -851,7 +1102,7 @@ class PigeonTransport:
             return False
         await self._ws.send(image_frame)
         await asyncio.sleep(0.35)
-        for command in (10019, 10020, 10021):
+        for command in (10020, 10021):
             await send_control(command, pause=0.08)
 
         ack_wait = asyncio.create_task(self._ack_event.wait())
@@ -1020,6 +1271,32 @@ class PigeonTransport:
             frame = replace_bytes_field(frame, 8, f8)
         return self._replace_varint_field(frame, 2, timestamp_ms)
 
+    def _rebuild_enter_frame(self, conv_id, security_receiver_id, shop_id):
+        """重建「进会话」帧：只换会话号和买家键，其余（版本、设备、签名）沿用模板。
+
+        服务端收到这帧会回「该会话的票据 + 会话短 ID」，文本发送靠它。
+        载荷在 f610.f1：f2 = 会话号，f20 = 买家复合键。
+        """
+        template = getattr(self, "_enter_template", None)
+        if not template:
+            return None
+        frame = self._refresh_session_frame(template)
+        f8 = get_bytes_field(frame, 8)
+        inner = get_bytes_field(f8, 8)
+        payload = get_bytes_field(inner, 610) if inner else None
+        wrapper = get_bytes_field(payload, 1) if payload else None
+        if not wrapper:
+            return None
+        wrapper = self._replace_varint_field(wrapper, 2, int(conv_id))
+        wrapper = self._replace_any_field(
+            wrapper, 20, self._conversation_key(security_receiver_id, shop_id)
+        )
+        payload = replace_bytes_field(payload, 1, wrapper)
+        inner = replace_bytes_field(inner, 610, payload)
+        f8 = replace_bytes_field(f8, 8, inner)
+        frame = replace_bytes_field(frame, 8, f8)
+        return self._with_frame_time(frame, int(time.time() * 1000))
+
     def _rebuild_control_frame(self, command, conv_id, security_receiver_id, shop_id):
         """Rebuild one non-text frame from the browser's conversation flow."""
         template = self._frames_by_cmd.get(command)
@@ -1031,18 +1308,12 @@ class PigeonTransport:
         if not inner:
             return self._with_frame_time(frame, int(time.time() * 1000))
         conversation_key = self._conversation_key(security_receiver_id, shop_id)
-        if command in (10013, 10017, 10019, 10020):
+        if command in (10013, 10017, 10020):
             payload = get_bytes_field(inner, 2000)
             if payload:
                 payload = self._replace_varint_field(payload, 1, int(conv_id))
                 payload = self._replace_any_field(payload, 10, conversation_key)
                 inner = replace_bytes_field(inner, 2000, payload)
-        elif command == 10014:
-            payload = get_bytes_field(inner, 616)
-            if payload:
-                payload = self._replace_varint_field(payload, 1, int(conv_id))
-                payload = self._replace_any_field(payload, 12, conversation_key)
-                inner = replace_bytes_field(inner, 616, payload)
         elif command == 10015:
             payload = get_bytes_field(inner, 610)
             wrapper = get_bytes_field(payload, 1) if payload else None
@@ -1276,6 +1547,8 @@ class PigeonTransport:
 
     def close(self):
         self._closed = True
+        # 票据绑在当前连接上，连接一断就作废，缓存必须一起清掉。
+        self._ticket_cache.clear()
         for key, value in list(PigeonTransport._instances.items()):
             if value is self:
                 PigeonTransport._instances.pop(key, None)

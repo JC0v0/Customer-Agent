@@ -355,7 +355,12 @@ class KnowledgeUI(QWidget):
             return
 
         for i, shop in enumerate(shops):
-            self.shop_combo.addItem(shop.shop_name)
+            # 多平台下多个店铺同名（如「示例店铺」同时存在于拼多多/抖音），
+            # 只显示店铺名会让同步选错店铺、走错渠道 provider。
+            channel = getattr(shop, "channel", None)
+            channel_name = getattr(channel, "channel_name", "") or ""
+            label = "[{}] {} ({})".format(channel_name, shop.shop_name, shop.shop_id)
+            self.shop_combo.addItem(label)
             self.shop_combo.setItemData(i, shop.id)
             self._shop_cache[shop.id] = shop.shop_name
 

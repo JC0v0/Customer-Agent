@@ -1,6 +1,8 @@
 # 生命周期管理模块（抖音渠道，结构与拼多多一致）
 import asyncio
+import json
 import os
+import threading
 import time
 import websockets
 from urllib.parse import urlencode
@@ -11,34 +13,99 @@ from utils.runtime_path import get_temp_path
 from Channel.douyin.utils.API.get_token import GetToken
 from Channel.douyin.message_rules import (
     Origin,
-    classify_merchant_sender,
-    clear_self_sent,
     is_agent_message,
     is_self_client_message,
-    is_self_sent,
     resolve_http_origin,
 )
 from config import config
 from bridge.context import (
     ChannelType,
     make_account_key,
-    make_handoff_key,
     make_queue_name,
 )
-from core.session_state import SessionState
-from Channel.douyin.session_paths import existing_pigeon_session_path
+from Channel.douyin.session_paths import (
+    existing_pigeon_capture_path,
+    existing_pigeon_session_path,
+    legacy_pigeon_capture_path,
+)
+from Channel.douyin.core.douyin_connection import DouyinConfigError
 
-# 发送帧 / 接收请求模板路径（统一走运行时临时目录，兼容打包环境）
-PIGEON_TEMPLATE_PATH = str(get_temp_path("dy_send_capture.json"))
 # 接收用的请求模板（v3 get_user_message 的 protobuf body 抓包）。
 # 与发送模板是两份不同的抓包，不能共用：发送帧是 WS 帧，接收是 HTTP body。
+# 文件缺失时 PigeonHttp 会回退包内脱敏骨架，不再是硬性前置。
 PIGEON_USRMSG_TEMPLATE_PATH = str(get_temp_path("dy_usermsg_template.json"))
+# 旧版全局录帧文件（只读兼容：老版本升级上来的机器还没重新登录时用）。
+LEGACY_PIGEON_CAPTURE_PATH = str(get_temp_path("dy_send_capture.json"))
 # HTTP 拉取轮询间隔（秒）。
 # 飞鸽 WS 只推会话状态，消息正文要靠 HTTP 拉取。间隔直接决定买家消息的
 # 可见延迟；空轮询已经不打日志、失败已限频，因此用短间隔保证及时接收。
 # 实测复用连接后单次请求 0.2 秒返回：0.4 秒间隔 + 一次请求 ≈ 0.6 秒一轮，
 # 买家发完消息到派发的平均延迟在半秒以内；WS 一有推送还会立刻唤醒。
 PIGEON_PULL_INTERVAL = 0.4
+
+# pigeon 纯协议启动必需的运行时产物（体检项）：
+#   1. 账号会话凭据（token/sign/device）——只有登录能产生；
+#   2. WS 握手/注册帧录帧——注册帧带店铺归属，凭空构造服务端不认。
+# 10018 发送帧和接收 body 都有包内脱敏骨架兜底（随程序分发），
+# 缺了也能发文本，所以不再列入硬性缺失。
+# 协议序列实测（2026 全年）：9 月旧协议 10008→10009→10011；headless 新连接
+# 10010→10011；11-13 真机 GUI 登录又变成 10005→10006→10011。握手帧命令号
+# 跟着客户端版本走，所以体检不认具体帧号，只认「命令号小于注册帧 10011」。
+# 10011 注册帧可选：消息正文由 HTTP 拉取兜底，缺它只少 WS 实时推送。
+PIGEON_REGISTER_CMD = 10011
+
+
+def _capture_frame_cmds(capture_path) -> set:
+    """解析录帧文件里出现过的命令号集合；文件缺失/损坏返回空集。"""
+    try:
+        from tools.reverse_probe.douyin.pigeon_assets import read_capture_frames
+        from tools.reverse_probe.douyin.pigeon_proto import parse_fields
+    except Exception:
+        return set()
+    cmds = set()
+    for raw in read_capture_frames(capture_path):
+        try:
+            fields = parse_fields(raw)
+            cmd = next((v for f, wt, v, _ in fields if f == 1 and wt == 0), None)
+        except Exception:
+            continue
+        if cmd is not None:
+            cmds.add(int(cmd))
+    return cmds
+
+
+def missing_pigeon_assets(session_path, capture_path=None) -> list:
+    """返回缺失的 pigeon 运行时文件（空列表表示齐全）。
+
+    capture_path 缺省时退回旧版全局录帧路径，兼容老调用方。
+    """
+    missing = []
+    try:
+        session_exists = session_path.exists()
+    except Exception:
+        session_exists = False
+    if not session_exists:
+        missing.append(("账号会话凭据", str(session_path)))
+    if capture_path is None:
+        capture_path = LEGACY_PIGEON_CAPTURE_PATH
+    cmds = _capture_frame_cmds(capture_path)
+    # 握手/认证帧至少录到一个即可。帧号随客户端版本变（10005/10006、
+    # 10008/10009、10010 都实测出现过），所以按「小于注册帧 10011」判断，
+    # 不写死白名单——写死的结果就是每次抖音改版都把用户挡在门外。
+    has_handshake = any(c < PIGEON_REGISTER_CMD for c in cmds)
+    if not has_handshake:
+        # 退一步：只录到注册帧也允许启动，连接后由传输层实际握手结果说话。
+        has_handshake = PIGEON_REGISTER_CMD in cmds
+    if not has_handshake:
+        # 再退一步：整条编号规则都被改掉时，只要有帧就放行。传输层会按
+        # 录制顺序把前两帧当握手发出去，连不上会自己走重登/报错，不该由
+        # 这里替它判死。
+        has_handshake = len(cmds) >= 2
+    if not has_handshake:
+        # 文件缺失/为空/缺关键帧都归到同一项：握手与注册帧只能来自
+        # 真实登录会话，重新登录即可自动补齐（登录流程会自动录帧）。
+        missing.append(("WS 握手/注册帧录帧", str(capture_path)))
+    return missing
 
 # 同账号只允许一条消息循环：新实例启动时取消旧循环，避免双投递复发。
 _ACTIVE_PIGEON_LOOPS: dict = {}
@@ -497,11 +564,51 @@ class LifecycleMixin:
         """
         from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport, PigeonSession
 
+        queue_name = make_queue_name(ChannelType.DOUYIN, shop_id, user_id)
+        session_path = existing_pigeon_session_path(shop_id, user_id, username)
+        capture_path = str(existing_pigeon_capture_path(shop_id, user_id, username))
+
+        # 先体检再建消费者：缺文件时不要起那套 10 worker 的队列。否则每次
+        # 重试都会「全停 + 全起」刷一屏 Consumer worker stopped/started。
+        missing = missing_pigeon_assets(session_path, capture_path)
+        session_missing = False
+        for label, _path in missing:
+            if label == "账号会话凭据":
+                session_missing = True
+        if session_missing:
+            self.status_manager.update_status(
+                shop_id, user_id, username, ConnectionState.ERROR, "no_pigeon_session"
+            )
+            self.logger.error(
+                f"会话凭据缺失: {shop_id}-{username}，请重新登录以刷新会话凭据"
+            )
+            return False
+
+        if missing:
+            parts = []
+            for label, path in missing:
+                parts.append(f"{label} 不存在: {path}")
+            detail = "; ".join(parts)
+            self.status_manager.update_status(
+                shop_id, user_id, username, ConnectionState.ERROR, "pigeon_assets_missing"
+            )
+            self.logger.error(
+                f"pigeon 抓包模板缺失，无法建立连接: {shop_id}-{username}，{detail}"
+            )
+            labels = []
+            for label, path in missing:
+                labels.append(f"{label}({os.path.basename(path)})")
+            # 放到「缺的那个文件本该在的目录」，而不是写死常量里的路径：
+            # 打包版和源码版的数据目录不一样，写死会把用户指到错地方。
+            target_dir = os.path.dirname(missing[0][1])
+            raise DouyinConfigError(
+                f"抖音消息通道缺少抓包文件（{'、'.join(labels)}），"
+                f"请把对应 json 放到 {target_dir} 后重启程序"
+            )
+
         try:
-            queue_name = make_queue_name(ChannelType.DOUYIN, shop_id, user_id)
             await self._setup_message_consumer(queue_name, shop_id, user_id)
 
-            session_path = existing_pigeon_session_path(shop_id, user_id, username)
             if not session_path.exists():
                 self.status_manager.update_status(
                     shop_id, user_id, username, ConnectionState.ERROR, "no_pigeon_session"
@@ -512,7 +619,7 @@ class LifecycleMixin:
                 return False
 
             transport = PigeonTransport(
-                PigeonSession.from_json(str(session_path)), PIGEON_TEMPLATE_PATH
+                PigeonSession.from_json(str(session_path)), capture_path
             )
             try:
                 ok = await asyncio.to_thread(transport.connect, 15)
@@ -535,6 +642,7 @@ class LifecycleMixin:
             account_key = make_account_key(ChannelType.DOUYIN, shop_id, user_id)
             PigeonTransport.set_instance(transport, account_key)
             self.pigeon_transport = transport
+            self._start_page_sender(shop_id, user_id, username)
             self.status_manager.update_status(
                 shop_id, user_id, username, ConnectionState.CONNECTED
             )
@@ -549,6 +657,47 @@ class LifecycleMixin:
                 f"连接错误: {shop_id}-{username}, error_type={type(e).__name__}"
             )
             return False
+
+    def _start_page_sender(self, shop_id: str, user_id: str, username: str) -> None:
+        """后台启动隐藏浏览器，只用于发送。
+
+        正文帧必须带目标会话的票据，票据只随页面打开的会话下发且很快失效，
+        所以发送交给页面。接收仍走 HTTP 拉取，与这个浏览器无关。
+        """
+        from Channel.douyin.feige_bridge import FeigeBridge, account_sender_profile
+
+        bridge = FeigeBridge.instance(make_account_key(ChannelType.DOUYIN, shop_id, user_id))
+        if bridge.is_running:
+            return
+        profile = account_sender_profile(shop_id, user_id, username)
+        if not profile:
+            self.logger.warning(
+                f"无法创建页面发送 profile，页面发送不可用: {shop_id}-{username}"
+            )
+            return
+        cookies = {}
+        try:
+            session_path = existing_pigeon_session_path(shop_id, user_id, username)
+            raw = json.loads(session_path.read_text(encoding="utf-8"))
+            cookies = raw.get("cookies_full") or {}
+        except Exception as e:
+            self.logger.warning(
+                f"读取登录 cookies 失败，页面可能停在登录页: "
+                f"error_type={type(e).__name__}"
+            )
+        threading.Thread(
+            target=bridge.start,
+            kwargs={
+                "headless": True,
+                "poll": False,
+                "profile": profile,
+                "cookies": cookies,
+            },
+            daemon=True,
+            name="feige-sender",
+        ).start()
+        self._page_bridge = bridge
+        self.logger.info(f"页面发送通道启动中: {shop_id}-{username}")
 
     async def _pigeon_wait(self, shop_id: str, user_id: str, username: str, on_success: callable, on_failure: callable):
         """pigeon 消息循环等待（连接成功后调用，阻塞直到停止）。"""
@@ -604,7 +753,7 @@ class LifecycleMixin:
              get_user_message 时间线接口，WS 一有状态变化就立刻唤醒。
              一次请求同时取回：
                - 买家消息 → 送入消息管线，并回填 security_sender_id/shop_id/talk_id
-               - 商家侧消息 → 判定人工介入，静默转人工（见 _mark_handoff_by_merchant）
+               - 商家侧消息 → 不回复、不转人工，只记 DEBUG（与拼多多一致）
 
         不用「当前会话列表」接口：会话被系统关闭后就不在那个列表里（实测
         total=0），而买家仍会继续往该会话发消息，用它做主路径会彻底收不到。
@@ -799,24 +948,21 @@ class LifecycleMixin:
                 else:
                     since_us = int(time.time() * 1e6) - 300 * 1000 * 1000
                 baseline_ready = True
-                self.logger.info(
-                    f"接收基线建立: {shop_id}-{username}, 已有 {len(msgs)} 条"
-                    f"（一律不回复），只回此后新消息"
-                )
+                # 基线建立是通道启动的正常内部流程，不写日志（任何级别）：
+                # 界面日志会直接展示它，用户会误以为出了状况。
                 msgs = []
 
             if msgs:
                 newest_us = since_us
-                # 先处理商家侧：同一条时间线里人工回复可能紧跟买家消息，
-                # 必须先标记转人工，AI 才不会抢在人工前面回。
+                # 商家侧消息与拼多多一致：不回复、不转人工，只记一行 DEBUG。
                 for m in msgs:
                     ts = int(m.get("ts") or 0)
                     if ts > newest_us:
                         newest_us = ts
                     if resolve_http_origin(m) is not Origin.MERCHANT:
                         continue
-                    # 只认商家坐席（CurrentServer / role=2）。店铺机器人
-                    # 与本程序 AI 回复都是 role=4，不能算人工介入。
+                    # 只认商家坐席（CurrentServer / role=2）。店铺机器人、
+                    # 本程序 AI 回复、会话动作与系统提示都不是人打的字。
                     if not is_agent_message(m):
                         continue
                     if is_self_client_message(m.get("client_message_id")):
@@ -825,9 +971,6 @@ class LifecycleMixin:
                     text = str(m.get("text") or "").strip()
                     if not conv or not text:
                         continue
-                    # 商家侧同样要按「会话 + 时间戳 + 正文」去重。游标每轮回退
-                    # 5 秒，同一条人工回复会被反复读到；不去重就会每 0.4 秒
-                    # 重新标记一次转人工，日志刷屏且掩盖真正的新消息。
                     dedupe_key = self._pigeon_dedupe_key({
                         "msg_id": m.get("msg_id"),
                         "conv_id": conv,
@@ -838,13 +981,10 @@ class LifecycleMixin:
                         continue
                     if dedupe_key:
                         seen_msg.add(dedupe_key)
-                    self._mark_handoff_by_merchant({
-                        "conv_id": conv,
-                        "text": text,
-                        "ts": ts,
-                        "sender_kind": "human",
-                        "src": str(m.get("sender_biz_role") or ""),
-                    }, shop_id, username)
+                    self.logger.debug(
+                        f"商家侧消息，不回复: conv={conv}, "
+                        f"src={m.get('sender_biz_role') or '?'}, text={text[:30]!r}"
+                    )
 
                 for m in msgs:
                     ts = int(m.get("ts") or 0)
@@ -882,8 +1022,8 @@ class LifecycleMixin:
                         "client_message_id": m.get("client_message_id") or "",
                     }
                     self.logger.debug(
-                        f"received message: type=text, shop_id={shop_id}, "
-                        f"conv={conv}, text={text[:40]!r}"
+                        f"received message: channel=douyin, type=text, "
+                        f"shop_id={shop_id}, conv={conv}, text_len={len(text)}"
                     )
                     await self._dispatch_pigeon_event(
                         ev, shop_id, user_id, username, queue_name
@@ -926,49 +1066,6 @@ class LifecycleMixin:
             state["shop_id"] = message["shop_id"]
         if message.get("talk_id"):
             state["talk_id"] = str(message["talk_id"])
-
-    def _mark_handoff_by_merchant(self, item, shop_id, username) -> None:
-        """商家侧出现新消息 → 静默转人工（与拼多多 MALL_CS 分支一致）。
-
-        判定依据是「登录的客服商家账号自己发出了消息」：
-          - 来源为商家侧（sender_role=2 / CurrentServer），由 message_rules 判定
-          - 不是本程序刚发出的那条：AI 的回复同样以商家侧身份回流，
-            不排除的话每发一次就自我转人工一次
-        命中后只做 mark_handoff，不回复、不发企业微信通知，到期自动恢复。
-
-        handoff key 的 uid 维度用 conv_id：消息派发时 from_uid 就是 conv_id，
-        ai_handler 检查 is_handoff 用的也是它，两边必须一致，否则标记等于没打。
-        """
-        conv_id = str(item.get("conv_id") or "")
-        text = str(item.get("text") or "").strip()
-        if not conv_id or not text:
-            return
-        # 本程序自己发的回声：消费掉指纹后直接返回。
-        if is_self_sent(shop_id, conv_id, text):
-            clear_self_sent(shop_id, conv_id, text)
-            return
-        sender_kind = str(item.get("sender_kind") or "")
-        if sender_kind == "robot":
-            self.logger.debug(
-                f"商家侧机器人消息，不转人工: conv={conv_id}, "
-                f"text={text[:30]!r}"
-            )
-            return
-        session_key = make_handoff_key(ChannelType.DOUYIN, shop_id, conv_id)
-        try:
-            if SessionState().is_handoff(session_key):
-                return
-            SessionState().mark_handoff(session_key)
-            self.logger.info(
-                f"检测到商家侧消息，会话静默转人工（不再回复且不通知）: "
-                f"session_key={session_key}, shop={shop_id}, "
-                f"src={item.get('src') or '?'}, text={text[:30]!r}"
-            )
-        except Exception as exc:
-            self.logger.error(
-                f"人工介入静默标记失败（不影响主流程）: "
-                f"error_type={type(exc).__name__}, exc={exc}"
-            )
 
     async def _auto_refresh_douyin_credentials(self, shop_id, user_id, username,
                                                transport=None, http=None) -> bool:
@@ -1425,6 +1522,36 @@ class LifecycleMixin:
             await self._cleanup_heartbeat_tasks()
             await self._cleanup_health_tasks()
             await self.resource_manager.cleanup_all()
+
+            # 关闭页面发送用的隐藏浏览器，避免下次启动 profile 被占
+            bridge = getattr(self, "_page_bridge", None)
+            if bridge is not None:
+                try:
+                    await asyncio.to_thread(bridge.stop)
+                except Exception as e:
+                    self.logger.warning(
+                        f"关闭页面发送浏览器失败: error_type={type(e).__name__}"
+                    )
+                self._page_bridge = None
+
+            # 关闭 pigeon 协议通道。close() 会把实例从注册表摘掉并断开 WS；
+            # 不关的话停止账号后残留的 transport 仍被 send_text 认作「可用」，
+            # 随后到达的消息会走协议发送、抛 send_exception，再落页面兜底
+            # （页面已停），最后报 all_failed。2026-11-14 02:07:57 真机复现。
+            account_key = getattr(self, "_account_key", None)
+            if account_key:
+                try:
+                    from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
+
+                    transport = PigeonTransport.instance(account_key)
+                    if transport is not None:
+                        # close() 内部会 join 后台线程，必须放到线程池里跑。
+                        await asyncio.to_thread(transport.close)
+                        self.logger.info("已关闭 pigeon 协议通道")
+                except Exception as e:
+                    self.logger.warning(
+                        f"关闭协议通道失败: error_type={type(e).__name__}"
+                    )
 
             try:
                 await self.consumer_manager.stop_consumer(queue_name, remove=True)

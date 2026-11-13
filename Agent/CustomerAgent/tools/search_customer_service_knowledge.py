@@ -4,7 +4,7 @@
 
 根据关键词和店铺ID搜索客服知识。
 """
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel, Field
 from Agent.CustomerAgent.custom.tool_decorator import agent_tool
 
@@ -19,8 +19,14 @@ def _get_knowledge_service() -> KnowledgeService:
 
 class SearchCustomerServiceKnowledgeParams(BaseModel):
     """搜索客服知识参数"""
+    # 渠道必须受信任注入：抖音的 shop_id 是 douyin_<店铺名> 字符串，
+    # 只按 shop_id 解析在跨渠道同名时会串店。
+    channel_type: Optional[str] = Field(default=None, description="渠道类型（受信任注入）")
     query: str = Field(..., description="搜索关键词（必须提供）")
-    shop_id: int = Field(..., description="店铺ID（必须提供）")
+    # 不能声明成 int：抖音 shop_id 是 douyin_示例店铺 这样的字符串，
+    # Pydantic 会在工具执行前抛 ValidationError，表现为抖音下客服知识
+    # 永远返回「工具执行失败」。
+    shop_id: Optional[Union[str, int]] = Field(default=None, description="店铺ID（必须提供）")
 
 
 @agent_tool(
@@ -51,6 +57,7 @@ def search_customer_service_knowledge(params: SearchCustomerServiceKnowledgePara
         shop_id=params.shop_id,
         query=params.query,
         goods_id=None,
+        channel_name=params.channel_type,
     )
 
     return knowledge_service.format_search_result(result)

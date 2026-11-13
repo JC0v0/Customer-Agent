@@ -7,15 +7,15 @@ logger = get_logger("SendMessage")
 
 
 class SendMessage(BaseRequest):
-    """抖音消息发送器（优先 pigeon 纯协议，回退浏览器桥）
+    """抖音消息发送器（pigeon 协议优先，页面通道兜底）
 
     【传输层选择】
-    1. pigeon 纯协议（推荐，与拼多多同构）：由
-       tools/reverse_probe/douyin/pigeon_transport.PigeonTransport 维护持久 WS，
-       会话凭据(token+pigeon_sign)从浏览器抓取一次复用（等同拼多多 cookie）。
-       send_text 走 WS 帧 type=10018，已实证服务端 ACK code=0 且消息真实投递。
-    2. 浏览器桥（feige_bridge.py）：当 pigeon 传输未初始化/未连接时自动回退，
-       走 DOM（输入框+发送按钮），签名由页面自身完成。
+    1. pigeon 纯协议（首选）：先发一帧「进会话」拿回本会话票据（服务端下发，
+       约 11 分钟有效），再把正文帧发出去，几百毫秒投递完成，不需要浏览器
+       常驻。2026-11-14 真机 + HTTP 时间线双重验证通过。
+    2. 浏览器页面（兜底）：协议未连接、票据拿不到、或服务端静默丢弃时，
+       交给飞鸽页面（点会话 → 填输入框 → 点发送），页面自己带票据。
+       见 Channel/douyin/feige_bridge.py。
 
     - send_image / send_mallGoodsCard / move_conversation：三级降级
       （pigeon→bridge→degraded），始终返回 dict 绝不返回 None，协议待逆向。
@@ -47,106 +47,170 @@ class SendMessage(BaseRequest):
         from bridge.context import make_account_key
         return make_account_key(self.channel_name, self.shop_id, self.user_id)
 
+    def _buyer_nickname(self, conv_id: str) -> str:
+        """会话号 → 买家昵称（页面按昵称定位会话）。"""
+        try:
+            from tools.reverse_probe.douyin.pigeon_conv_list import PigeonConvList
+            from Channel.douyin.session_paths import existing_pigeon_session_path
+            from Channel.douyin.utils.API.order_query import extract_buyer_nick_from_ext
+
+            # 会话文件按登录用户名落盘，必须带上它才能命中（见 session_paths）。
+            session_path = existing_pigeon_session_path(
+                self.shop_id, self.user_id, getattr(self, "account_name", "") or ""
+            )
+            convs = PigeonConvList(str(session_path)).fetch_conversations() or []
+        except Exception as exc:
+            self.logger.warning(
+                f"会话列表拉取失败，无法定位买家昵称: conv={conv_id}, "
+                f"error_type={type(exc).__name__}"
+            )
+            return ""
+        for conv in convs:
+            cid = str(conv.get("parentConShortId") or conv.get("subConversationId") or "")
+            if cid != str(conv_id):
+                continue
+            for item in conv.get("msgList") or []:
+                body = item.get("messageBody") or {}
+                nick = extract_buyer_nick_from_ext(body.get("ext"))
+                if nick:
+                    return nick
+        return ""
+
+    def _send_by_page(self, conv_id: str, text: str, wait_seconds: float = 40) -> bool:
+        """页面发送：点会话 → 填输入框 → 点发送，页面自己带票据。
+
+        刚连上账号时浏览器还在加载，这里等它就绪而不是直接放弃：页面没起来
+        时退回 pigeon 一定失败（票据拿不到），等一会儿反而能把消息发出去。
+        """
+        import time
+
+        from Channel.douyin.feige_bridge import FeigeBridge
+        from Channel.douyin.message_rules import record_self_sent
+
+        bridge = FeigeBridge.instance(self._transport_key())
+        if not bridge.is_send_ready:
+            deadline = time.time() + wait_seconds
+            while not bridge.is_send_ready and time.time() < deadline:
+                if not bridge.is_running:
+                    break
+                time.sleep(0.5)
+        if not bridge.is_send_ready:
+            self.logger.warning(
+                f"页面通道未就绪，发送跳过: conv={conv_id}, "
+                f"running={getattr(bridge, 'is_running', None)}"
+            )
+            return False
+        nick = self._buyer_nickname(conv_id)
+        if not nick:
+            self.logger.error(f"发送文本消息失败: 未取到买家昵称, conv={conv_id}")
+            return False
+        if not bridge.send_text(nick, text):
+            self.logger.error(
+                f"发送文本消息失败: recipient={conv_id}, nick={nick}, transport=page"
+            )
+            return False
+        record_self_sent(self.shop_id, conv_id, text)
+        return True
+
     def _degraded_not_implemented(self, method_name: str) -> None:
         self.logger.warning(
             f"{method_name} 暂不支持: 降级返回空结果"
         )
 
+    def _send_by_protocol(self, recipient_uid: str, message_content: str):
+        """pigeon 纯协议发送：进会话取票 → 发正文帧 → 等商家侧回声。
+
+        2026-11-14 真机实证：进会话帧（10014/f610）只换会话号和买家键，
+        服务端就回本会话的票据；正文帧带齐会话号/票据/会话短 ID/买家复合键
+        即可投递，HTTP 时间线能查到原文。成功后无需浏览器。
+        返回 dict 表示成功，None 表示这次没发出去（交给页面通道兜底）。
+        """
+        from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
+        from Channel.douyin.message_rules import record_self_sent, clear_self_sent
+
+        pt = PigeonTransport.instance(self._transport_key())
+        if pt is None:
+            self.logger.info("协议通道未连接，转页面通道")
+            return None
+        try:
+            # 预登记回声指纹（发送前，不是发送成功后）。
+            #
+            # 真机 2026-11-11 01:18:14 复现：服务端推送的商家侧回声比
+            # send_text() 返回更早到达，拉取循环先读到了它，此时指纹还没
+            # 登记，于是把自己刚发的第 2 条回复判成「人工客服介入」，
+            # 整条会话静默转人工。发送前登记即可关掉这个竞态；
+            # 发送失败时立刻撤销，避免同文本的真人消息被吞。
+            record_self_sent(self.shop_id, recipient_uid, message_content)
+            ok = pt.send_text(recipient_uid, message_content)
+            if ok:
+                self.logger.info(
+                    f"发送文本消息成功: recipient={recipient_uid}, transport=pigeon"
+                )
+                return {
+                    "success": True,
+                    "recipient_uid": recipient_uid,
+                    "transport": "pigeon",
+                }
+            clear_self_sent(self.shop_id, recipient_uid, message_content)
+            detail = getattr(pt, "last_send_result", {}) or {}
+            reason = detail.get("reason", "unknown")
+            # 把服务端返回码和实际使用的会话短 ID 一并打出来：text_no_echo
+            # 这类空洞结论看不出到底是「登录过期」「会话已关闭」还是
+            # 「发到了旧子会话」。
+            extra = ""
+            if detail.get("code") is not None:
+                extra = ", code=%s, msg=%s" % (detail.get("code"), detail.get("msg") or "")
+            elif detail.get("detail"):
+                extra = ", detail=%s" % detail.get("detail")
+            if detail.get("talk_id"):
+                extra += ", talk_id=%s" % detail.get("talk_id")
+            if detail.get("ack_code") is not None:
+                extra += ", ack_code=%s, ack_msg=%s" % (
+                    detail.get("ack_code"), detail.get("ack_msg") or ""
+                )
+            self.logger.warning(
+                f"协议发送未成功，转页面通道: recipient={recipient_uid}, "
+                f"reason={reason}{extra}"
+            )
+            return None
+        except Exception as exc:
+            self.logger.error(
+                f"协议发送异常，转页面通道: error_type={type(exc).__name__}"
+            )
+            return None
+
     def send_text(self, recipient_uid, message_content):
         """
         发送文本消息。
 
-        优先 pigeon 纯协议：recipient_uid 为会话 conversation_id（数值字符串），
-        由 PigeonTransport 依据 conv_state 缓存回填 security_receiver_id/shop_id。
-        若 pigeon 传输未就绪则回退浏览器桥（recipient_uid 为买家显示名）。
+        优先 pigeon 纯协议：进会话帧换回本会话票据后直接发正文帧，几百毫秒
+        就能投递，不依赖浏览器常驻。协议不通（未连接、票据拿不到、服务端静默
+        丢弃）时退回页面通道，由页面自己带票据把消息发出去。
         阻塞到发送完成/超时，成功返回 {"success": True}。
         """
         recipient_uid = str(recipient_uid)
         message_content = str(message_content)
 
-        # 1) pigeon 协议（首选）
-        #    先走 HTTP 单次请求（与拼多多 send_message 同构），失败再走 WS 协议流。
-        #    因此这里不再要求 WS 已连接：HTTP 不需要长连接。
-        try:
-            from tools.reverse_probe.douyin.pigeon_transport import PigeonTransport
-            from Channel.douyin.message_rules import record_self_sent, clear_self_sent
-            pt = PigeonTransport.instance(self._transport_key())
-            if pt is not None:
-                # 预登记回声指纹（发送前，不是发送成功后）。
-                #
-                # 真机 2026-11-11 01:18:14 复现：服务端推送的商家侧回声比
-                # send_text() 返回更早到达，拉取循环先读到了它，此时指纹还没
-                # 登记，于是把自己刚发的第 2 条回复判成「人工客服介入」，
-                # 整条会话静默转人工。发送前登记即可关掉这个竞态；
-                # 发送失败时立刻撤销，避免同文本的真人消息被吞。
-                record_self_sent(self.shop_id, recipient_uid, message_content)
-                ok = pt.send_text(recipient_uid, message_content)
-                if ok:
-                    self.logger.info(
-                        f"发送文本消息成功: recipient={recipient_uid}"
-                    )
-                    return {
-                        "success": True,
-                        "recipient_uid": recipient_uid,
-                        "transport": "pigeon",
-                    }
-                clear_self_sent(self.shop_id, recipient_uid, message_content)
-                detail = getattr(pt, "last_send_result", {}) or {}
-                reason = detail.get("reason", "unknown")
-                # 把服务端返回码和实际使用的会话短 ID 一并打出来：text_no_echo
-                # 这类空洞结论看不出到底是「登录过期」「会话已关闭」还是
-                # 「发到了旧子会话」。short_id 与 talk_id 对不上时，基本就是
-                # 会话被平台关闭后又重开、子会话 ID 已经换了一轮。
-                extra = ""
-                if detail.get("code") is not None:
-                    extra = ", code=%s, msg=%s" % (detail.get("code"), detail.get("msg") or "")
-                elif detail.get("detail"):
-                    extra = ", detail=%s" % detail.get("detail")
-                if detail.get("short_id"):
-                    extra += ", short_id=%s, talk_id=%s" % (
-                        detail.get("short_id"), detail.get("talk_id") or ""
-                    )
-                if detail.get("ack_code") is not None:
-                    extra += ", ack_code=%s, ack_msg=%s" % (
-                        detail.get("ack_code"), detail.get("ack_msg") or ""
-                    )
-                self.logger.error(
-                    f"发送文本消息失败: recipient={recipient_uid}, reason={reason}{extra}"
-                )
-                return None
-        except Exception as exc:
-            self.logger.error(
-                f"发送文本消息异常: error_type={type(exc).__name__}, "
-                f"transport=pigeon"
-            )
+        # 1) pigeon 纯协议
+        result = self._send_by_protocol(recipient_uid, message_content)
+        if result:
+            return result
 
-        # 2) 浏览器桥（回退）
-        try:
-            from Channel.douyin.feige_bridge import FeigeBridge
-            bridge = FeigeBridge.instance()
-            if not bridge.is_ready:
-                self.logger.error(
-                    f"发送文本消息失败: 浏览器桥未就绪, recipient={recipient_uid}"
-                )
-                return None
-            ok = bridge.send_text(recipient_uid, message_content)
-            if ok:
-                try:
-                    from Channel.douyin.message_rules import record_self_sent
-                    record_self_sent(self.shop_id, recipient_uid, message_content)
-                except Exception:
-                    pass
-                return {"success": True, "recipient_uid": recipient_uid, "transport": "bridge"}
-            self.logger.error(
-                f"发送文本消息失败: recipient={recipient_uid}, transport=bridge"
+        # 2) 页面通道（兜底）
+        if self._send_by_page(recipient_uid, message_content):
+            self.logger.info(
+                f"发送文本消息成功: recipient={recipient_uid}, transport=page"
             )
-            return None
-        except Exception as exc:
-            self.logger.error(
-                f"发送文本消息异常: error_type={type(exc).__name__}, "
-                f"transport=bridge"
-            )
-            return None
+            return {
+                "success": True,
+                "recipient_uid": recipient_uid,
+                "transport": "page",
+            }
+
+        self.logger.error(
+            f"发送文本消息失败: recipient={recipient_uid}, transport=all_failed"
+        )
+        return None
 
     # 图片上传端点（待逆向：飞鸽图片上传接口，通常返回 image_url/resource_id）
     IMAGE_UPLOAD_ENDPOINT = None

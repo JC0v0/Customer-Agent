@@ -102,15 +102,15 @@ class CatchAllHandler(MessageHandler):
         return True
 
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
-        """记录所有消息，用于调试和统计（不记录完整内容以保护隐私）"""
+        """兜底处理并记一行 debug（不记录完整内容以保护隐私）。
+
+        原来这里打 6 行 INFO（含两条分隔线），每条没有被专用处理器接走的
+        消息都刷一遍，日志面板里非常突兀——拼多多走专用处理器，一条都不打，
+        两个渠道看起来完全不像同一个程序。收敛成一行 debug。
+        """
         content_length = len(str(context.content)) if context.content else 0
-
-        self.logger.info(f"=== 消息处理记录 ===")
-        self.logger.info("用户与消息标识已省略以保护隐私")
-        self.logger.info(f"消息类型: {context.type}")
-        self.logger.info(f"渠道类型: {context.channel_type}")
-        self.logger.info(f"消息内容长度: {content_length}")
-        self.logger.info(f"消息已被CatchAllHandler处理")
-        self.logger.info(f"===================")
-
+        self.logger.debug(
+            f"消息兜底处理: type={context.type}, channel={context.channel_type}, "
+            f"content_length={content_length}"
+        )
         return True  # 总是返回True，避免"没有合适的处理器"警告

@@ -18,7 +18,8 @@ from Channel.pinduoduo.utils.API.product_manager import ProductManager
 from database.knowledge_service import KnowledgeService
 from utils.logger_loguru import get_logger
 from utils.llm_provider import LLMProfile, ProfileValidationError
-from utils.llm_transport import async_completion
+from utils.llm_transport import LLMTransportError, async_completion
+from utils.llm_transport import LLMErrorCategory
 
 logger = get_logger("ProductSync")
 
@@ -461,14 +462,40 @@ class ProductSyncService:
         ]
 
         try:
-            response = await async_completion(
-                profile,
-                messages,
-                temperature=0.3,
-                use_tools=False,
-                response_format={"type": "json_object"},
-                timeout=120.0,
-            )
+            try:
+                response = await async_completion(
+                    profile,
+                    messages,
+                    temperature=0.3,
+                    use_tools=False,
+                    response_format={"type": "json_object"},
+                    timeout=120.0,
+                )
+            except LLMTransportError as exc:
+                # 纯文本模型（如 glm-4-flash）收到 image_url 会被供应商以参数类
+                # 错误拒绝。这里不预判模型是否支持视觉、也不缓存这个结论：
+                # LiteLLM 的能力表对视觉模型同样报「不支持」，拿它当开关会在
+                # 支持视觉的模型上误关图片。只去掉图片重试一次——商品知识的
+                # 主体来自名称/规格/描述文字，缺图仍可提取。
+                from Agent.CustomerAgent.custom.multimodal import (
+                    has_image_blocks,
+                    strip_image_blocks,
+                )
+
+                if (
+                    getattr(exc, "category", None) is not LLMErrorCategory.PARAMETER
+                    or not has_image_blocks(messages)
+                ):
+                    raise
+                response = await async_completion(
+                    profile,
+                    strip_image_blocks(messages),
+                    temperature=0.3,
+                    use_tools=False,
+                    response_format={"type": "json_object"},
+                    timeout=120.0,
+                )
+                logger.info("商品图被模型拒绝，本次仅用文字信息提取商品知识")
             content = str(response.content or "").strip()
             logger.debug(f"LLM输出长度={len(content)}")
 

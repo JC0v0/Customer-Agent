@@ -260,26 +260,31 @@ def _apply_response_format(
     profile: LLMProfile,
     response_format: Dict[str, Any],
 ) -> None:
-    """保留 JSON 约束，仅绕过火山适配器已确认的 json_object 能力表缺项。
+    """保留 JSON 约束，绕过 LiteLLM 能力表缺项。
 
-    其他供应商 / 格式仍交给 LiteLLM 正常校验；不能因为能力未知就假定
-    服务端支持。探测失败也保留标准参数，让错误可见，而非静默丢参数。
+    LiteLLM 会拿自己的能力表做本地校验：表里没有的参数直接抛
+    ``UnsupportedParamsError``，请求根本发不出去。而能力表落后于供应商
+    实际能力——智谱（zai）的 glm 系列明确支持 ``response_format``，LiteLLM
+    的 zai 表里却没有，于是商品知识提取每次都失败（2026-11-13 真机：
+    ``zai does not support parameters: ['response_format']``）。
+
+    处理办法：探到能力表明确不含该参数时，把它挪进 ``extra_body`` 原样
+    透传给服务端。``None`` 表示能力未知而不是不支持，保持标准参数不动，
+    让真实错误可见。
     """
     payload["response_format"] = response_format
-    if (
-        profile.provider is not LLMProvider.VOLCENGINE
-        or response_format.get("type") != "json_object"
-    ):
+    if response_format.get("type") != "json_object":
         return
 
+    provider_prefix = provider_spec(profile.provider).litellm_prefix.rstrip("/")
     try:
         supported = _load_litellm().get_supported_openai_params(
-            model=profile.model_name, custom_llm_provider="volcengine"
+            model=profile.model_name, custom_llm_provider=provider_prefix
         )
     except Exception as exc:
         logger.warning(
             "response_format capability probe failed; "
-            f"error_type={type(exc).__name__} provider=volcengine"
+            f"error_type={type(exc).__name__} provider={profile.provider.value}"
         )
         return
 
@@ -289,7 +294,9 @@ def _apply_response_format(
 
     payload.pop("response_format")
     payload.setdefault("extra_body", {})["response_format"] = response_format
-    logger.debug("response_format routed via extra_body; provider=volcengine")
+    logger.debug(
+        f"response_format routed via extra_body; provider={profile.provider.value}"
+    )
 
 
 def build_chat_payload(

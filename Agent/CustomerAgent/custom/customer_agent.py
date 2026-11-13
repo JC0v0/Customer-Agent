@@ -268,7 +268,10 @@ class CustomerAgent(Bot):
             user_id = dependencies.get("user_id")
             if shop_id and user_id:
                 dependencies["product_list"] = await asyncio.to_thread(
-                    self._message_builder.fetch_product_list_text, shop_id, user_id
+                    self._message_builder.fetch_product_list_text,
+                    shop_id,
+                    user_id,
+                    dependencies.get("channel_type", ""),
                 )
             else:
                 dependencies["product_list"] = ""

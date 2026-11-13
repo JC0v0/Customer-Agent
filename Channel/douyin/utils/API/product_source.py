@@ -22,6 +22,7 @@ from websockets.sync.client import connect
 
 from utils.logger_loguru import get_logger
 from utils.runtime_path import get_data_path
+from utils.win_process import kill_process_tree
 
 logger = get_logger("DouyinProductSource")
 
@@ -69,6 +70,10 @@ class DouyinProductSource:
 
     PRODUCT_PAGE_URL = "https://fxg.jinritemai.com/ffa/g/list"
     PRODUCT_LIST_PATH = "/product/tproduct/list"
+    # 抖店登录态是 .jinritemai.com 全子域共享，注入时必须写父域
+    COOKIE_DOMAIN = ".jinritemai.com"
+    # 未登录时页面会落到这个路径，此时 list 接口返回空列表而非报错
+    LOGIN_PATH_MARK = "/login"
     EDGE_CANDIDATES = (
         Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
         Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
@@ -105,15 +110,36 @@ class DouyinProductSource:
                 "total": 0,
                 "page": page,
                 "size": size,
-                "error_msg": f"抖店商品页读取失败: {type(exc).__name__}",
+                "error_msg": self._failure_message(exc),
             }
+
+    @staticmethod
+    def _failure_message(exc: BaseException) -> str:
+        """把内部失败原因翻成用户能照做的提示。"""
+        reason = str(exc) if isinstance(exc, ValueError) else ""
+        messages = {
+            # 登录态失效：list 接口照样返回 code=0 空列表，必须单独报出来，
+            # 否则用户只会看到「同步成功 0 个商品」而不知道该重新登录。
+            "merchant_login_required": "抖店后台登录态已失效，请重新登录该抖音账号后再拉取",
+            "merchant_product_api_rejected": "抖店商品接口拒绝请求，请稍后重试",
+            "merchant_product_page_unavailable": "抖店商品页未出现翻页控件，暂只能拉取首页",
+            "unexpected_product_list_response": "抖店商品接口返回结构异常",
+        }
+        return messages.get(reason, f"抖店商品页读取失败: {type(exc).__name__}")
 
     def _inject_session_cookies(self, client: _CdpClient) -> int:
         """把登录时抓到的完整 cookies 注入本次临时浏览器会话。
 
-        商品页抓取用的是独立 Edge profile，与主程序登录用的浏览器不是同一个；
-        不注入登录态，页面会停在登录页，等不到 /product/tproduct/list 响应，
-        最终 45 秒超时。凭据统一取 temp/dy_session_live.json（登录时写入）。
+        商品页抓取用的是独立 Edge profile，与主程序登录用的浏览器不是同一个，
+        所以必须注入登录态。凭据取登录时写入的 dy_session_*.json。
+
+        必须按**父域** ``.jinritemai.com`` 注入，不能用 ``url=`` 交给 CDP 推断：
+        给 url 时 CDP 会写成 host-only cookie（domain 精确等于 fxg.jinritemai.com），
+        而抖店登录态原本是 ``.jinritemai.com`` 全子域共享，SSO 跳转链上的
+        sso.jinritemai.com 读不到 host-only cookie，于是判定未登录，页面落到
+        /login/common（实测 2026-11-13：url 注入 → 登录页；domain 注入 → 直接进
+        商品后台）。未登录时 list 接口仍返回 code=0 空列表，表现为「同步成功 0 个
+        商品」，比报错更难排查。
         """
         from database import db_manager
         from Channel.douyin.session_paths import existing_pigeon_session_path
@@ -139,7 +165,10 @@ class DouyinProductSource:
             entries.append({
                 "name": str(name),
                 "value": str(value),
-                "url": "https://fxg.jinritemai.com/",
+                "domain": self.COOKIE_DOMAIN,
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
             })
         try:
             client.call("Network.setCookies", {"cookies": entries}, timeout=10)
@@ -173,6 +202,11 @@ class DouyinProductSource:
             self._inject_session_cookies(client)
             client.call("Page.navigate", {"url": self._page_url(page, size)})
             payload = self._read_product_response(client)
+            # 空列表有两种可能：店铺确实没商品，或登录态失效被踢回登录页。
+            # 后者的 list 接口同样返回 code=0 + 空数组，若不单独判定就会报
+            # 「同步成功 0 个商品」，用户看到的是假成功（2026-11-13 实测）。
+            if not (payload.get("data") or []) and self._landed_on_login(client):
+                raise ValueError("merchant_login_required")
             # The merchant page does not honor page/pageSize URL parameters.
             # Use its own paginator so every request keeps a valid a_bogus token.
             for _ in range(1, max(1, int(page))):
@@ -188,12 +222,11 @@ class DouyinProductSource:
         finally:
             if client is not None:
                 client.close()
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            # Edge 是多进程的：terminate() 只结束启动器主进程，渲染/网络等
+            # 子进程会留成孤儿，浏览器窗口挂在桌面上不关（表现为「一直停在
+            # 浏览器」）。按进程树整体结束，并只针对本次 pid，不碰用户自己
+            # 开的浏览器。
+            kill_process_tree(process.pid)
 
     @classmethod
     def normalize_product(cls, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -293,6 +326,18 @@ class DouyinProductSource:
         if not isinstance(payload, dict) or payload.get("code") not in (0, "0"):
             raise ValueError("merchant_product_api_rejected")
         return payload
+
+    def _landed_on_login(self, client: _CdpClient) -> bool:
+        """判断当前页面是否被踢到登录页（登录态失效）。"""
+        try:
+            result = client.call("Runtime.evaluate", {
+                "expression": "location.pathname",
+                "returnByValue": True,
+            }, timeout=5)
+        except Exception:
+            return False
+        path = str(result.get("result", {}).get("value") or "")
+        return self.LOGIN_PATH_MARK in path
 
     @classmethod
     def _is_product_response(cls, event: Dict[str, Any]) -> bool:

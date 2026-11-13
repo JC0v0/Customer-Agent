@@ -5,13 +5,12 @@ from typing import Any, Dict, Optional
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, pyqtSignal as Signal, QTimer
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout, QWidget, QLabel,
                             QMessageBox, QDialog, QFormLayout)
-from PyQt6.QtGui import QFont, QPixmap, QPainter, QPainterPath
+from PyQt6.QtGui import QFont, QPixmap
 from qfluentwidgets import (CardWidget, SubtitleLabel, CaptionLabel, BodyLabel,
                            PrimaryPushButton, PushButton, StrongBodyLabel,
                            InfoBadge, ScrollArea, FluentIcon as FIF)
 from service.account_service import account_service
 from utils.logger_loguru import get_logger
-from utils.safe_image_fetch import fetch_image
 
 logger = get_logger("UserUI")
 
@@ -24,39 +23,12 @@ class LogoLoaderThread(QThread):
         self.url = url
 
     def run(self):
-        try:
-            image_data = fetch_image(self.url)
+        # load_logo 任何失败都会返回非空占位图，并在 DEBUG 记录真实原因。
+        # 旧实现解码失败时抛 ValueError，日志只留下 error_type=ValueError、
+        # 丢掉具体消息，界面上还会显示「加载失败」。
+        from ui.logo_helper import load_logo
 
-            pixmap = QPixmap()
-            pixmap.loadFromData(image_data)
-
-            if pixmap.isNull():
-                raise ValueError("Loaded data is not a valid image.")
-
-            # 创建圆形pixmap
-            size = 60
-            circular_pixmap = QPixmap(size, size)
-            circular_pixmap.fill(Qt.GlobalColor.transparent)
-
-            painter = QPainter(circular_pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            
-            path = QPainterPath()
-            path.addEllipse(0, 0, size, size)
-            
-            painter.setClipPath(path)
-            
-            # 缩放并绘制原始图片
-            scaled_pixmap = pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.drawPixmap(0, 0, scaled_pixmap)
-            painter.end()
-
-            self.logo_loaded.emit(circular_pixmap)
-        except Exception as e:
-            logger.error(
-                f"Failed to load logo: error_type={type(e).__name__}"
-            )
-            self.logo_loaded.emit(QPixmap()) # 失败时发射空pixmap
+        self.logo_loaded.emit(load_logo(self.url))
 
 class LoginThread(QThread):
     """登录验证线程"""

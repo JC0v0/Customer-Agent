@@ -1,7 +1,29 @@
 """
 抖音订单查询 API（对齐拼多多 OrderQuery 接口签名）。
 
-【数据源：抖店商家后台订单列表接口，2026-11-12 逆向并实测验证】
+【数据源一：飞鸽 IM 客服工作台的订单接口，2026-11-13 抓包确认】
+
+    POST https://pigeon.jinritemai.com/backstage/cmpoent/order/query
+
+    这是买家进线时客服工作台右侧「订单」面板实际调用的接口：鉴权用飞鸽域
+    自己的登录 cookie，与消息通道同一套凭据，不需要另外登录抖店商家后台，
+    因此买家一进线就能查，比绕到工作台后台快一步。
+
+    响应（真实抓包）：
+        {"check_spam_resp": {...}, "order_info": {
+            "order_id": "69194...", "order_status": 3,
+            "order_status_desc": "已发货", "order_type_desc": "普通订单",
+            "create_time": 1794303361, "actual_pay_amount": 12980,
+            "full_address": "贵州省贵阳市…", "pay_type_desc": "支付宝",
+            "logistics_info": {"tracking_no": "...", "express_company": "申通快递"},
+            "sku_order_list": [...], "buyer_words": "", "order_remark": "",
+        }}
+
+    两处容易「顺手改错」的地方：
+    1. 路径里的 `cmpoent` 是服务端真实拼写（不是 component），改了会 404；
+    2. 金额单位是分（actual_pay_amount=12980 即 129.80 元），与 searchlist 一致。
+
+【数据源二：抖店商家后台订单列表接口，2026-11-12 逆向并实测验证】
 
 主接口：
     GET https://fxg.jinritemai.com/api/order/searchlist
@@ -41,22 +63,44 @@
 已知限制：
     1. 飞鸽域 pigeon.jinritemai.com/backstage/getOrder 实测返回
        {"code":"10001010A","msg":"当前环境存在风险"}，被风控拦截，
-       需 a_bogus 签名，本实现不使用该接口。
+       需 a_bogus 签名，本实现不使用该接口。注意它与上面的
+       cmpoent/order/query 不是同一个接口，后者是 IM 页面在用的。
     2. 飞鸽域 getuserbyorder 实测返回 11001「飞鸽版本过低」，同样不使用。
     3. cookie 需包含抖店后台域。登录流程抓取的是全浏览器 cookie，
        若抖店后台未登录过，订单接口返回未登录，走消息历史骨架兜底。
 
 回退路径：
-    真实接口失败（未登录 / 网络 / 订单不存在）时，回退到会话消息历史里
-    正则提取订单号，仅返回订单号骨架，其余字段标注「待核实」。
+    IM 接口失败（登录态 / 风控 / 网络）时回退到抖店后台 searchlist；
+    两者都失败时，用 Agent 会话历史里买家发过的订单号返回骨架，
+    其余字段标注「待核实」。
 """
+import json
 import re
+
+import requests
 
 from ..base_request import BaseRequest
 from utils.logger_loguru import get_logger
 from Channel.douyin.utils.log_throttle import throttled_warning, throttled_info
 
 logger = get_logger("DouyinOrderQuery")
+
+# IM 页面（飞鸽工作台）订单接口。`cmpoent` 是服务端真实拼写，不要「纠正」。
+PIGEON_ORDER_QUERY_URL = (
+    "https://pigeon.jinritemai.com/backstage/cmpoent/order/query"
+)
+
+# 请求体形态候选。该接口是页面内部接口，没有对外文档，抓包只留下响应，
+# 字段只能按响应结构反推：先试最可能的，命中后记住形态，不再逐个试探。
+IM_BODY_STYLES = (
+    ("order_id", lambda oid, cid: {"order_id": oid}),
+    ("order_id_biz", lambda oid, cid: {"order_id": oid, "biz_type": 4}),
+    ("data_wrap", lambda oid, cid: {"data": {"order_id": oid}}),
+    ("order_id_cid", lambda oid, cid: {"order_id": oid, "cid": cid or ""}),
+)
+
+# 所有形态都失败后的冷却时间：避免每条买家消息都白试 4 次请求
+_IM_COOLDOWN_SECONDS = 600
 
 # 抖音订单号正则：15-25 位连续数字（抖店订单号通常 18-20 位）
 _ORDER_ID_PATTERN = re.compile(r"\b(\d{15,25})\b")
@@ -142,6 +186,17 @@ _LIST_HEADERS = {
     "referer": "https://fxg.jinritemai.com/ffa/morder/order/list",
 }
 
+# IM 接口要带 IM 页面自己的 referer：用 fxg 的会被服务端按跨站请求拒掉
+_IM_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/json",
+    "referer": "https://im.jinritemai.com/pc_seller_v2/main/workspace",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+}
+
 _FIXED_PARAMS = {
     "order_by": "create_time",
     "order": "desc",
@@ -173,6 +228,169 @@ def _fen_to_yuan(v):
         return None
 
 
+def _unwrap_cookies(raw):
+    """把登录 JSON / 纯 cookie 字典统一成 {name: value}。
+
+    登录结果里真正的 cookie 在 cookies_full 下，外层还有 verifyFp / msToken
+    等风控参数。直接拿外层当 cookie 发出去，服务端只认到空登录态。
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    inner = raw.get("cookies_full")
+    if isinstance(inner, dict) and inner:
+        return {str(k): str(v) for k, v in inner.items()}
+    cookies = {}
+    for key, value in raw.items():
+        if key in ("verifyFp", "msToken", "shop_name", "user_name"):
+            continue
+        if isinstance(value, (str, int, float)):
+            cookies[str(key)] = str(value)
+    return cookies
+
+
+def _resolve_session_path(shop_id=None, user_id=None, name=None):
+    """定位当前账号的飞鸽登录态文件。
+
+    登录态文件从早期的全局 dy_session_live.json 改成了按账号隔离
+    （见 Channel/douyin/session_paths.py），所以这里不能写死路径，
+    必须走同一个解析函数；否则多账号时会读到别人的凭据，或者直接
+    一个都读不到（IM 查单和会话订单号会静默失效）。
+
+    Args:
+        shop_id / user_id / name: 账号标识。都不给时取最近写入的那份
+            （探针脚本、单账号场景用）。
+
+    Returns:
+        Path 或 None
+    """
+    try:
+        from Channel.douyin.session_paths import (
+            existing_pigeon_session_path,
+            legacy_pigeon_session_path,
+        )
+    except Exception as exc:
+        logger.info(f"飞鸽登录态模块不可用: error_type={type(exc).__name__}")
+        return None
+
+    if shop_id or user_id or name:
+        return existing_pigeon_session_path(shop_id, user_id, name)
+
+    legacy = legacy_pigeon_session_path()
+    newest_path = None
+    newest_mtime = 0.0
+    try:
+        entries = list(legacy.parent.glob("dy_session_*.json"))
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.name == legacy.name:
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > newest_mtime:
+            newest_mtime = mtime
+            newest_path = entry
+    if newest_path is not None:
+        return newest_path
+    return legacy
+
+
+def load_session_cookies(session_path=None):
+    """读取飞鸽登录态文件里的 cookie（与消息通道同一份凭据）。
+
+    Returns:
+        dict: cookie 字典；文件不存在 / 结构异常时返回空字典（调用方自行降级）
+    """
+    if not session_path:
+        session_path = _resolve_session_path()
+    if not session_path:
+        return {}
+    try:
+        with open(session_path, encoding="utf-8") as fp:
+            session = json.load(fp)
+    except (OSError, ValueError):
+        return {}
+    return _unwrap_cookies(session)
+
+
+def _cookie_header(cookies):
+    parts = []
+    for name, value in cookies.items():
+        parts.append("%s=%s" % (name, value))
+    return "; ".join(parts)
+
+
+def collect_session_order_ids(conv_id, session_path=None):
+    """从飞鸽会话列表取该会话出现过的订单号（买家进线即可查的那一步）。
+
+    数据来源与消息接收同一条链路（get_current_conversation_list）：
+    买家发来的订单卡片 messageBody.ext.bury_order_id 就是真实订单号；
+    买家直接打字发订单号的，从正文按 15-25 位数字提取。
+
+    与 _extract_order_ids 的分工：那边读 Agent 会话库（历史，稳），
+    这边读平台会话列表（实时，买家刚发就能拿到），两者互为补充。
+
+    Args:
+        conv_id: 父会话 ID（抖音渠道的 from_uid 就是它）
+        session_path: 登录态文件路径，默认按账号自动解析（见 session_paths）
+
+    Returns:
+        List[str]: 订单号（去重，保持出现顺序）。失败返回空列表，不抛异常。
+    """
+    conv_id = str(conv_id or "").strip()
+    if not conv_id:
+        return []
+
+    try:
+        from tools.reverse_probe.douyin.pigeon_conv_list import PigeonConvList
+
+        if not session_path:
+            session_path = _resolve_session_path()
+        if not session_path:
+            return []
+        conversations = PigeonConvList(str(session_path)).fetch_conversations() or []
+    except Exception as exc:
+        logger.info(
+            f"会话订单号提取失败（跳过，不影响其他路径）: "
+            f"conv={conv_id}, error_type={type(exc).__name__}"
+        )
+        return []
+
+    order_ids = []
+    seen = set()
+
+    def _add(order_id):
+        order_id = str(order_id or "").strip()
+        if order_id and order_id.isdigit() and order_id not in seen:
+            seen.add(order_id)
+            order_ids.append(order_id)
+
+    for conv in conversations:
+        cid = str(conv.get("parentConShortId") or "")
+        if not cid:
+            cid = str(conv.get("subConversationId") or "")
+        if cid != conv_id:
+            continue
+        for item in conv.get("msgList") or []:
+            body = item.get("messageBody") or {}
+            if not isinstance(body, dict):
+                continue
+            for order_id in extract_card_order_ids(body):
+                _add(order_id)
+            content = str(body.get("content") or "")
+            if content:
+                for match in _ORDER_ID_PATTERN.finditer(content):
+                    _add(match.group(1))
+    return order_ids
+
+
 def _classify_refund(status_desc):
     """从订单状态文案识别退款/关闭/售后状态。"""
     text = str(status_desc or "")
@@ -190,9 +408,16 @@ def _classify_refund(status_desc):
 
 
 class OrderQuery(BaseRequest):
-    """抖音订单查询器（抖店后台 searchlist 主路径，消息历史兜底）。"""
+    """抖音订单查询器（IM 订单接口优先，抖店后台兜底，最后会话历史骨架）。"""
 
     ORDER_LIST_URL = "https://fxg.jinritemai.com/api/order/searchlist"
+    IM_ORDER_QUERY_URL = PIGEON_ORDER_QUERY_URL
+
+    # 类级状态：哪种请求体形态被接受（进程内记住，避免每次都试探）
+    _im_style = None
+    # 各账号的冷却截止时间（key = shop_id|user_id）。按账号分开：
+    # 一个店铺登录态失效，不该让另一个店铺也跟着退到后台接口。
+    _im_disabled_until = {}
 
     def __init__(self, shop_id: str = None, user_id: str = None, cookies=None):
         super().__init__(shop_id=shop_id, user_id=user_id, channel_name="douyin")
@@ -200,6 +425,8 @@ class OrderQuery(BaseRequest):
             self.update_cookies(cookies)
         # 最近一次 _search_orders 失败原因（"" = 未失败/未调用）
         self.last_search_error = ""
+        # 最近一次 IM 接口失败原因（诊断用）
+        self.last_im_error = ""
 
     # ==================================================================
     # 对外接口
@@ -220,10 +447,151 @@ class OrderQuery(BaseRequest):
         if not order_id:
             return None
 
+        # 1) IM 页面同款接口：与消息通道共用飞鸽 cookie，买家进线即可查
+        detail = self.get_order_detail_via_im(order_id)
+        if detail is not None:
+            return detail
+
+        # 2) 抖店后台订单列表（需要 fxg 域 cookie）
         rows = self._search_orders({"order_id": order_id}, limit=1)
         if not rows:
             return None
         return self._normalize_order(rows[0])
+
+    def get_order_detail_via_im(self, order_id, cid=None):
+        """用飞鸽 IM 工作台的订单接口查单。
+
+        Args:
+            order_id (str): 订单号
+            cid (str): 会话 ID（可选，部分请求体形态需要）
+
+        Returns:
+            dict: 归一化订单；接口不可用/查不到返回 None（不抛异常）
+        """
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            return None
+
+        import time
+
+        cooldown_key = f"{self.shop_id}|{self.user_id}"
+        if time.time() < self.__class__._im_disabled_until.get(cooldown_key, 0.0):
+            self.last_im_error = "cooldown"
+            return None
+
+        cookies = self._im_cookies()
+        if not cookies:
+            self.last_im_error = "no_cookie"
+            return None
+
+        styles = IM_BODY_STYLES
+        if self.__class__._im_style:
+            for style in IM_BODY_STYLES:
+                if style[0] == self.__class__._im_style:
+                    styles = (style,)
+                    break
+
+        for name, build in styles:
+            body = build(order_id, cid)
+            info = self._im_post(body, cookies)
+            if info:
+                if self.__class__._im_style != name:
+                    self.__class__._im_style = name
+                    logger.info(f"抖音 IM 订单接口命中请求体形态: {name}")
+                return self._normalize_im_order(info)
+            # 登录失效 / 被风控时换别的请求体也没用，直接停，别让买家等四轮超时
+            if self._im_error_is_fatal(self.last_im_error):
+                break
+
+        # 全部形态都失败：冷却一段时间，避免每条买家消息都白试 4 次
+        self.__class__._im_disabled_until[cooldown_key] = (
+            time.time() + _IM_COOLDOWN_SECONDS
+        )
+        if not self.last_im_error:
+            self.last_im_error = "no_order_info"
+        throttled_warning(
+            logger, "order.im_fail",
+            f"抖音 IM 订单接口不可用，{_IM_COOLDOWN_SECONDS} 秒内改用后台接口: "
+            f"{self.last_im_error}"
+        )
+        return None
+
+    def _session_path(self):
+        """当前账号的飞鸽登录态文件（按账号隔离，与消息通道同一份）。"""
+        name = self.account_name
+        if not name or name == "未知账号":
+            name = None
+        return _resolve_session_path(self.shop_id, self.user_id, name)
+
+    def _im_cookies(self):
+        """IM 接口用的 cookie：优先登录态文件，其次账号表里的完整 cookie。"""
+        cookies = load_session_cookies(self._session_path())
+        if cookies:
+            return cookies
+        return _unwrap_cookies(self.cookies)
+
+    @staticmethod
+    def _im_error_is_fatal(error):
+        """这个错误再换请求体也没意义。
+
+        登录过期（10005）、风控、401/403 都属于「凭据或通道不可用」，
+        逐个试四种请求体只会把一次失败放大成四次超时等待。
+        """
+        error = str(error or "")
+        if not error:
+            return False
+        if error.startswith("http_401") or error.startswith("http_403"):
+            return True
+        if "10005" in error:
+            return True
+        for word in ("登录", "风控", "风险", "login"):
+            if word in error:
+                return True
+        return False
+
+    def _im_post(self, body, cookies):
+        """POST 一次 IM 订单接口，返回 order_info 字典或 None。"""
+        headers = dict(_IM_HEADERS)
+        headers["cookie"] = _cookie_header(cookies)
+        try:
+            resp = requests.post(
+                self.IM_ORDER_QUERY_URL,
+                json=body,
+                headers=headers,
+                timeout=5,
+            )
+        except Exception as exc:
+            self.last_im_error = f"{type(exc).__name__}"
+            return None
+
+        if resp.status_code != 200:
+            self.last_im_error = f"http_{resp.status_code}"
+            return None
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            self.last_im_error = "not_json"
+            return None
+
+        if not isinstance(payload, dict):
+            self.last_im_error = "not_dict"
+            return None
+
+        info = payload.get("order_info")
+        if not isinstance(info, dict) or not info:
+            # 有的网关会把业务数据再包一层 data
+            data = payload.get("data")
+            if isinstance(data, dict):
+                info = data.get("order_info")
+        if not isinstance(info, dict) or not info:
+            code = payload.get("code")
+            msg = payload.get("msg") or payload.get("message") or ""
+            self.last_im_error = f"code={code} msg={str(msg)[:60]}"
+            return None
+
+        self.last_im_error = ""
+        return info
 
     def get_buyer_orders(self, buyer_nick, page=0, page_size=20):
         """
@@ -372,15 +740,28 @@ class OrderQuery(BaseRequest):
 
     def _collect_orders(self, buyer_uid=None, days=7):
         """
-        汇总订单：消息历史取订单号 -> 真实接口补详情 -> 失败留骨架。
+        汇总订单：会话订单号 -> 接口补详情 -> 失败留骨架。
+
+        订单号取两路：先读飞鸽会话列表（买家刚发的订单卡片立刻能拿到），
+        取不到再读 Agent 会话历史（跨进程重启也在）。两路都不依赖
+        CapturedMessage 表——那张表在代码里没有写入点。
 
         Returns:
             List[dict]: 订单列表，无订单返回空列表
-            None: 店铺未登记等硬失败
+            None: 数据库不可用等硬失败
         """
-        order_ids = self._extract_order_ids(buyer_uid=buyer_uid, days=days)
-        if order_ids is None:
-            return None
+        order_ids = []
+        if buyer_uid:
+            order_ids = collect_session_order_ids(buyer_uid, self._session_path())
+            if order_ids:
+                logger.info(
+                    f"抖音订单查询: 会话内取到订单号 {len(order_ids)} 个 "
+                    f"conv={buyer_uid}"
+                )
+        if not order_ids:
+            order_ids = self._extract_order_ids(buyer_uid=buyer_uid, days=days)
+            if order_ids is None:
+                return None
         if not order_ids:
             logger.info(f"抖音订单查询: 消息历史中未匹配到订单号 shop_id={self.shop_id}")
             return []
@@ -486,6 +867,137 @@ class OrderQuery(BaseRequest):
                 return None
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_im_order(info):
+        """把 IM 接口的 order_info 归一化成订单 dict。
+
+        字段名来自 2026-11-13 真实抓包（见模块 docstring）。同一个订单
+        在两个接口里命名完全不同，所以单独一个归一化函数；退款 / 发货
+        状态的判定复用 _classify_refund，保证两条路径给模型的字段一致。
+        """
+        if not isinstance(info, dict):
+            return None
+
+        def _s(value):
+            return str(value or "").strip()
+
+        def _pick(source, *keys):
+            for key in keys:
+                value = _s(source.get(key))
+                if value:
+                    return value
+            return ""
+
+        logistics = info.get("logistics_info") or {}
+        if not isinstance(logistics, dict):
+            logistics = {}
+
+        sku_items = info.get("sku_order_list") or []
+        if not isinstance(sku_items, list):
+            sku_items = []
+        first_sku = sku_items[0] if sku_items and isinstance(sku_items[0], dict) else {}
+
+        # 地址：优先整串 full_address，缺了再拼省市区
+        address = _s(info.get("full_address"))
+        if not address:
+            parts = []
+            for key in ("province", "city", "town", "street"):
+                value = _s(info.get(key))
+                if value and value not in parts:
+                    parts.append(value)
+            detail = _s(info.get("detail") or info.get("address_detail"))
+            if detail:
+                parts.append(detail)
+            address = " ".join(parts)
+
+        status_desc = _s(info.get("order_status_desc"))
+        if not status_desc:
+            try:
+                status_desc = _ORDER_STATUS_MAP.get(int(info.get("order_status")), "未知状态")
+            except (TypeError, ValueError):
+                status_desc = "未知状态"
+
+        refund_status_desc = _classify_refund(status_desc)
+        needs_shipping = refund_status_desc not in ("已退款", "已关闭", "售后已结束")
+
+        tracking_no = _s(logistics.get("tracking_no"))
+        if not needs_shipping:
+            shipping_desc = "无需发货（已退款/已关闭）"
+        elif "已完成" in status_desc:
+            shipping_desc = "已签收"
+        elif tracking_no:
+            shipping_desc = "已发货"
+        else:
+            shipping_desc = "未发货"
+
+        try:
+            quantity = int(first_sku.get("count") or first_sku.get("num") or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        if not quantity:
+            quantity = 1
+
+        order = {
+            "order_sn": _s(info.get("order_id")),
+            "order_sequence_no": _s(info.get("order_id")),
+            "goods_name": _pick(first_sku, "product_name", "goods_name", "title", "sku_name"),
+            "goods_id": _pick(first_sku, "product_id", "goods_id"),
+            "goods_img": _pick(first_sku, "img", "product_img", "goods_img"),
+            "spec": _pick(first_sku, "spec", "sku_spec_desc", "sku_name"),
+            "quantity": quantity,
+            "order_status": info.get("order_status"),
+            "order_status_desc": status_desc,
+            "refund_status_desc": refund_status_desc,
+            "needs_shipping": needs_shipping,
+            "shipping_status_desc": shipping_desc,
+            # 金额单位是分，统一转元
+            "total_amount": _fen_to_yuan(info.get("order_amount")),
+            "pay_amount": _fen_to_yuan(
+                info.get("actual_pay_amount") or info.get("seller_price")
+            ),
+            "goods_amount": _fen_to_yuan(info.get("seller_price")),
+            "post_amount": _fen_to_yuan(info.get("post_amount")),
+            "coupon_amount": _fen_to_yuan(info.get("promotion_amount")),
+            "create_time": _fmt_ts(info.get("create_time")),
+            "pay_time": _fmt_ts(info.get("pay_time")),
+            "logistics_time": _fmt_ts(
+                logistics.get("logistics_time_sec") or logistics.get("logistics_time")
+            ),
+            "exp_ship_time": _fmt_ts(info.get("exp_ship_time") or info.get("ship_time")),
+            "receiver": _s(info.get("post_receiver") or info.get("receiver")),
+            "receiver_phone": _s(info.get("mobile") or info.get("receiver_phone")),
+            "address": address,
+            "seller_words": _s(info.get("order_remark")),
+            "buyer_words": _s(info.get("buyer_words")),
+            "pay_type": _s(info.get("pay_type_desc")),
+            "tracking_no": tracking_no,
+            # 上层工具（query_order_status._format_output）读的是 logistics_sn，
+            # 只写 tracking_no 会让「运单号」这一行永远不出现。
+            "logistics_sn": tracking_no,
+            "logistics_company": _s(
+                logistics.get("express_company") or logistics.get("company")
+            ),
+            "after_sales_status": 1 if refund_status_desc else 0,
+            "buyer_nick": _s(info.get("buyer_nick") or info.get("user_nickname")),
+            "source": "pigeon.im_order_query",
+        }
+
+        sub_orders = []
+        for item in sku_items:
+            if not isinstance(item, dict):
+                continue
+            sub_orders.append({
+                "order_sn": _pick(item, "item_order_id", "order_id"),
+                "goods_name": _pick(item, "product_name", "goods_name", "title"),
+                "goods_id": _pick(item, "product_id", "goods_id"),
+                "spec": _pick(item, "spec", "sku_spec_desc", "sku_name"),
+                "quantity": item.get("count") or item.get("num") or 1,
+                "pay_amount": _fen_to_yuan(item.get("pay_amount")),
+                "order_status_desc": _s(item.get("order_status_desc")),
+            })
+        order["sub_orders"] = sub_orders
+        return order
 
     @staticmethod
     def _normalize_order(row):
@@ -602,6 +1114,8 @@ class OrderQuery(BaseRequest):
             "buyer_words": str(row.get("buyer_words") or ""),
             "pay_type": str(row.get("pay_type_desc") or ""),
             "tracking_no": str(logistic.get("tracking_no") or ""),
+            # 与 IM 路径一致：工具输出读 logistics_sn
+            "logistics_sn": str(logistic.get("tracking_no") or ""),
             "logistics_company": str(logistic.get("company_code") or ""),
             "after_sales_status": 1 if refund_status_desc else 0,
             "buyer_nick": str(row.get("user_nickname") or ""),
@@ -674,4 +1188,11 @@ class OrderQuery(BaseRequest):
         }
 
 
-__all__ = ["OrderQuery"]
+__all__ = [
+    "OrderQuery",
+    "PIGEON_ORDER_QUERY_URL",
+    "collect_session_order_ids",
+    "extract_buyer_nick_from_ext",
+    "extract_card_order_ids",
+    "load_session_cookies",
+]

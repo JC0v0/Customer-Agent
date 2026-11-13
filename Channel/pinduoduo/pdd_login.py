@@ -87,7 +87,10 @@ class _CdpContextHandle:
     不会关闭我们用 subprocess 拉起的浏览器进程，需在此兜底。
 
     Edge 是多进程的，proc.terminate() 只杀主进程，渲染/GPU/网络等子进程会
-    残留为孤儿进程，浏览器窗口不关闭。改用 taskkill /T /F 杀整棵进程树。
+    残留为孤儿进程，浏览器窗口不关闭。改用 Win32 递归杀进程树。
+
+    不用 ``taskkill``：它是控制台程序，GUI 进程里 spawn 会弹黑框；打包后
+    PATH 里混进 _internal 目录还会让它报 0xc0000142 直接失效。
     """
 
     def __init__(self, context, proc):
@@ -99,18 +102,20 @@ class _CdpContextHandle:
         return getattr(self._context, name)
 
     async def close(self):
+        # context.close() 在连接已断（TargetClosedError 一类失败）时会无限
+        # 挂住，永远走不到下面的清理，浏览器窗口就留在桌面上——真机
+        # 表现为「登录完了浏览器不关」。加超时兜底，超时就跳过、直接杀进程树。
         try:
-            await self._context.close()
+            await asyncio.wait_for(self._context.close(), timeout=5)
         except Exception:
             pass
-        if self._proc and self._proc.poll() is None:
+        # 不看 poll()：Edge 启动器常把工作移交给子进程后自己先退出，
+        # 此时 poll() 已有返回码，但真正的浏览器窗口还开着。
+        if self._proc:
             try:
-                # 杀整棵进程树（主进程 + 所有 Edge 子进程），
-                # 避免 terminate() 只杀主进程留下孤儿进程导致浏览器不关闭。
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(self._proc.pid)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+                from utils.win_process import kill_process_tree
+
+                kill_process_tree(self._proc.pid)
             except Exception:
                 try:
                     self._proc.kill()
@@ -204,6 +209,29 @@ class PDDLogin():
         if removed:
             self.logger.debug(f"已清理 profile 锁文件 {removed}: {user_data_dir}")
 
+    def _kill_profile_browsers(self, user_data_dir: str) -> None:
+        """结束正在使用该 profile 目录的 msedge/chrome 进程（只匹配本目录）。
+
+        浏览器对同一 user-data-dir 有单例限制：旧实例没退出时，新实例会把
+        参数交给旧实例后立即退出，Playwright 侧表现为 TargetClosedError。
+        只按 profile 路径过滤，不会影响用户自己开的浏览器。
+
+        走 Win32 API 读命令行，不 spawn powershell：GUI 程序调控制台程序会
+        弹黑框，打包后还受 PATH 冲突影响（0xc0000142）。
+        """
+        if not user_data_dir:
+            return
+        try:
+            from utils.win_process import kill_by_commandline
+
+            killed = kill_by_commandline(
+                user_data_dir, ("msedge.exe", "chrome.exe")
+            )
+        except Exception:
+            killed = 0
+        if killed > 0:
+            self.logger.info(f"已清理占用登录 profile 的浏览器进程 {killed} 个")
+
     async def _launch_context(self, playwright, user_data_dir: str, headless: bool):
         """启动用户本地的浏览器，避免下载 Playwright 自带的 Chromium。
 
@@ -220,16 +248,27 @@ class PDDLogin():
 
         # 1) 用探测到的真实路径启动本地浏览器（比 channel 更可靠）
         if exe_path:
-            try:
-                return await playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    executable_path=exe_path,
-                    headless=headless,
-                    args=self._LAUNCH_ARGS,
-                )
-            except Exception as e:
-                attempts.append(f"{channel}({exe_path}): error_type={type(e).__name__}")
-                self.logger.warning(f"启动本地浏览器 {channel} 失败: {type(e).__name__}")
+            # 同一 profile 下还有没退干净的旧浏览器时，新浏览器会把参数
+            # 交给旧实例后立即退出（Playwright 报 TargetClosedError）。
+            # 第一次失败就先按 profile 精确清掉旧进程，再重试一次。
+            for retry in (0, 1):
+                try:
+                    return await playwright.chromium.launch_persistent_context(
+                        user_data_dir,
+                        executable_path=exe_path,
+                        headless=headless,
+                        args=self._LAUNCH_ARGS,
+                    )
+                except Exception as e:
+                    if retry == 0:
+                        self.logger.debug(
+                            f"启动本地浏览器 {channel} 失败({type(e).__name__})，"
+                            f"清理同 profile 残留进程后重试"
+                        )
+                        self._kill_profile_browsers(user_data_dir)
+                        continue
+                    attempts.append(f"{channel}({exe_path}): error_type={type(e).__name__}")
+                    self.logger.warning(f"启动本地浏览器 {channel} 失败: {type(e).__name__}")
 
         # 2) 回退：channel 方式（路径探测未命中时的兜底）。
         # 级 1 已用 executable_path 试过同一浏览器（pipe 模式同样秒退），跳过。
