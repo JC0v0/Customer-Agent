@@ -68,7 +68,11 @@ def get_sender(channel_type=None) -> Optional[ReplySender]:
     channel_type 为 None 或未注册时，回退到默认渠道（拼多多，当前唯一渠道）。
     """
     if channel_type is not None:
-        ct = channel_type if isinstance(channel_type, ChannelType) else ChannelType(str(channel_type))
+        try:
+            ct = channel_type if isinstance(channel_type, ChannelType) else ChannelType(str(channel_type))
+        except ValueError:
+            # 无法识别的渠道标识：按“未注册”处理，回退到默认渠道
+            ct = None
         if ct in _SENDERS:
             return _SENDERS[ct]
     return _SENDERS.get(ChannelType.PINDUODUO)

@@ -68,7 +68,7 @@ class SimpleMessageQueue:
             return None
 
         try:
-            if timeout:
+            if timeout is not None:
                 wrapper = await asyncio.wait_for(self._queue.get(), timeout)
             else:
                 wrapper = await self._queue.get()
