@@ -56,12 +56,80 @@ def _find_edge():
     return None
 
 
+def account_profile(shop_id=None, user_id=None, username=None):
+    """返回该账号登录时用过的浏览器 profile（与登录共用登录态）。
+
+    登录侧目录规则是 ``user_data/{safe_name}-{sha256(raw)[:12]}``，
+    这里按同样的规则生成候选并取第一个存在的；都没有则返回 None。
+    """
+    import hashlib
+    import re
+
+    from utils.runtime_path import get_data_path
+
+    root = str(get_data_path() / "user_data")
+    if not os.path.isdir(root):
+        return None
+    raws = []
+    if shop_id and user_id:
+        raws.append("douyin:%s:%s" % (shop_id, user_id))
+    if username:
+        raws.append(str(username))
+    if shop_id:
+        raws.append(str(shop_id))
+    for raw in raws:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")[:48] or "account"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        path = os.path.join(root, "%s-%s" % (safe, digest))
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def account_sender_profile(shop_id=None, user_id=None, username=None):
+    """页面发送专用 profile（与登录 profile 隔离）。
+
+    登录流程和页面通道同时打开同一 user-data-dir 时，第二个实例会抛
+    TargetClosedError（Edge 单实例锁），页面通道永远起不来。发送侧因此
+    单独用一个目录存缓存，登录态靠注入 cookies。
+    """
+    import hashlib
+    import re
+
+    from utils.runtime_path import get_data_path
+
+    raw = ""
+    if shop_id and user_id:
+        raw = "douyin:%s:%s" % (shop_id, user_id)
+    elif username:
+        raw = str(username)
+    elif shop_id:
+        raw = str(shop_id)
+    if not raw:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")[:48] or "account"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    root = str(get_data_path() / "user_data")
+    path = os.path.join(root, "%s-%s-page" % (safe, digest))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _logger():
     lg = logging.getLogger("FeigeBridge")
     if not lg.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(asctime)s [FeigeBridge] %(levelname)s %(message)s"))
-        lg.addHandler(h)
+        from utils.logger_loguru import get_logger as _get_loguru
+
+        _loguru = _get_loguru("FeigeBridge")
+
+        class _LoguruSink(logging.Handler):
+            def emit(self, record):
+                try:
+                    _loguru.log(record.levelname, record.getMessage())
+                except Exception:
+                    pass
+
+        lg.addHandler(_LoguruSink())
         lg.setLevel(logging.INFO)
     return lg
 
@@ -129,9 +197,33 @@ JS_ACTIVE_TITLE = """
 
 JS_CLICK_CONV = """
 (name) => {
-  const el = [...document.querySelectorAll('div[title]')].find(e => e.getAttribute('title') === name);
-  if (el) { el.click(); return true; }
-  return false;
+  const hits = [...document.querySelectorAll('div[title]')]
+    .filter(e => ((e.getAttribute('title') || '').trim()) === name);
+  if (hits.length === 0) return 'none';
+  if (hits.length > 1) return 'ambiguous:' + hits.length;
+  hits[0].scrollIntoView({block: 'center'});
+  hits[0].click();
+  return 'ok';
+}
+"""
+
+JS_SEND_BOX = """
+() => {
+  const tas = [...document.querySelectorAll('textarea')];
+  const ta = tas.find(t => (t.placeholder || '').indexOf('发送给') >= 0) || tas[0];
+  return {count: tas.length, placeholder: ta ? (ta.placeholder || '') : ''};
+}
+"""
+
+JS_LAST_SENT = """
+(title) => {
+  for (const el of document.querySelectorAll('div[title]')) {
+    if ((el.getAttribute('title') || '').trim() !== title) continue;
+    let node = el;
+    for (let i = 0; i < 4 && node.parentElement; i++) node = node.parentElement;
+    return (node.textContent || '').replace(/\\s+/g, ' ').trim();
+  }
+  return '';
 }
 """
 
@@ -155,38 +247,46 @@ JS_PAGE_STATE = """
 
 
 class FeigeBridge:
-    """飞鸽浏览器桥单例。"""
+    """飞鸽浏览器桥（按账号一个实例）。"""
 
-    _instance = None
+    _instances = {}
     _lock = threading.Lock()
 
     @classmethod
-    def instance(cls):
+    def instance(cls, key=""):
         with cls._lock:
-            if cls._instance is None:
-                cls._instance = FeigeBridge()
-            return cls._instance
+            if key not in cls._instances:
+                cls._instances[key] = FeigeBridge()
+            return cls._instances[key]
 
     def __init__(self):
         self.log = _logger()
         self._stop = threading.Event()
         self._thread = None
         self._page = None
+        self._profile = None
+        self._cookies = {}
         self._ctx = None
         self._ready = threading.Event()
+        self._send_ready = threading.Event()
         self._event_q = queue.Queue()
         self._cmd_q = queue.Queue()
         self._seen = {}          # title -> set(已处理买家消息文本)
         self._active_title = None
 
     # ---------- 生命周期 ----------
-    def start(self, headless=False):
+    def start(self, headless=False, poll=True, profile=None, cookies=None):
+        """启动常驻浏览器。poll=False 时只供发送使用，不轮询会话列表。"""
         if self._thread and self._thread.is_alive():
             self.log.warning("bridge already running")
             return
         self._stop.clear()
+        self._ready.clear()
+        self._send_ready.clear()
+        self._profile = profile or FEIGE_PROFILE
+        self._cookies = dict(cookies or {})
         self._thread = threading.Thread(
-            target=self._worker, args=(headless,), daemon=True, name="feige-bridge"
+            target=self._worker, args=(headless, poll), daemon=True, name="feige-bridge"
         )
         self._thread.start()
         self._ready.wait(timeout=120)
@@ -196,10 +296,20 @@ class FeigeBridge:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
+        self._ready.clear()
+        self._send_ready.clear()
 
     @property
     def is_ready(self):
         return self._ready.is_set() and not self._stop.is_set()
+
+    @property
+    def is_send_ready(self):
+        return self._send_ready.is_set() and not self._stop.is_set()
+
+    @property
+    def is_running(self):
+        return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
 
     # ---------- 对外事件/命令 ----------
     def get_event(self, timeout=1.0):
@@ -211,6 +321,14 @@ class FeigeBridge:
 
     def send_text(self, session, text, timeout=60):
         """发送文本消息到指定买家会话（阻塞到完成）。返回 True/False。"""
+        if not self._send_ready.is_set():
+            if not self.is_running:
+                self.log.error("桥未运行，无法发送")
+                return False
+            # 浏览器正在启动：等会话列表渲染完再发，避免刚连上就丢回复。
+            if not self._send_ready.wait(timeout=min(timeout, 40)):
+                self.log.error("桥尚未就绪（会话列表未渲染），放弃本次发送")
+                return False
         fut = concurrent.futures.Future()
         self._cmd_q.put(("send_text", (session, text), fut))
         try:
@@ -220,7 +338,7 @@ class FeigeBridge:
             return False
 
     # ---------- worker ----------
-    def _worker(self, headless):
+    def _worker(self, headless, poll=True):
         try:
             from playwright.sync_api import sync_playwright
 
@@ -228,7 +346,7 @@ class FeigeBridge:
             self.log.info("启动飞鸽桥浏览器: %s", edge)
             with sync_playwright() as p:
                 ctx = p.chromium.launch_persistent_context(
-                    FEIGE_PROFILE,
+                    self._profile or FEIGE_PROFILE,
                     executable_path=edge,
                     headless=headless,
                     args=["--disable-blink-features=AutomationControlled", "--disable-notifications"],
@@ -236,6 +354,17 @@ class FeigeBridge:
                 self._ctx = ctx
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 self._page = page
+                # 登录态来自 pigeon 抓到的整包 cookies：profile 里的网页会话
+                # 可能早就过期，注入后才进得了工作台。
+                if self._cookies:
+                    try:
+                        ctx.add_cookies([
+                            {"name": str(k), "value": str(v), "domain": ".jinritemai.com",
+                             "path": "/", "secure": True, "httpOnly": False}
+                            for k, v in self._cookies.items()
+                        ])
+                    except Exception as e:
+                        self.log.warning("注入 cookies 失败: %s", repr(e))
                 try:
                     page.goto(WORKSPACE_URL, wait_until="domcontentloaded", timeout=60000)
                 except Exception as e:
@@ -248,16 +377,37 @@ class FeigeBridge:
                 else:
                     self.log.error("未进入飞鸽工作台（可能未登录或页面异常），请检查浏览器窗口")
                     self._ready.set()  # 仍然标记 ready，让上层知道已启动但可能未登录
+                if not poll:
+                    # 只用于发送：等会话列表渲染出来，然后挂在命令队列上。
+                    if self._wait_conversations(page, timeout=60):
+                        self._send_ready.set()
+                    self._command_loop(page)
+                    return
                 # 预热：把当前已显示的买家消息标记为已见，避免启动时追发历史消息
                 try:
                     self._prime_seen(page)
                 except Exception as e:
                     self.log.warning("预热失败: %s", repr(e))
+                self._send_ready.set()
                 self._poll_loop(page)
         except Exception as e:
             self.log.error("worker 异常退出: %s", repr(e))
         finally:
             self._ready.set()
+
+    def _wait_conversations(self, page, timeout=60):
+        """等左侧会话列表渲染完成，否则按标题点不到会话。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._stop.is_set():
+                return False
+            try:
+                if page.evaluate(JS_LIST_CONVS):
+                    return True
+            except Exception:
+                pass
+            time.sleep(2)
+        return False
 
     def _wait_ready(self, page, timeout=90):
         deadline = time.time() + timeout
@@ -333,30 +483,37 @@ class FeigeBridge:
                 cmd, args, fut = self._cmd_q.get_nowait()
             except queue.Empty:
                 return
+            self._run_command(page, cmd, args, fut)
+
+    def _command_loop(self, page):
+        """只用于发送的模式：阻塞等命令，不轮询会话列表。"""
+        while not self._stop.is_set():
             try:
-                if cmd == "send_text":
-                    ok = self._do_send_text(page, *args)
-                    fut.set_result(ok)
-                elif cmd == "scan_convs":
-                    fut.set_result(page.evaluate(JS_LIST_CONVS))
-                elif cmd == "read_chat":
-                    session = args[0]
-                    page.evaluate(JS_CLICK_CONV, session)
-                    time.sleep(1.0)
-                    fut.set_result(page.evaluate(JS_READ_CHAT))
-                elif cmd == "get_state":
-                    fut.set_result(page.evaluate(JS_PAGE_STATE))
-                elif cmd == "js_eval":
-                    expr = args[0]
-                    if isinstance(expr, str):
-                        fut.set_result(page.evaluate(expr))
-                    else:
-                        fut.set_result(page.evaluate(expr))
-                else:
-                    fut.set_result(False)
-            except Exception as e:
-                self.log.error("命令 %s 执行异常: %s", cmd, repr(e))
+                cmd, args, fut = self._cmd_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            self._run_command(page, cmd, args, fut)
+
+    def _run_command(self, page, cmd, args, fut):
+        try:
+            if cmd == "send_text":
+                fut.set_result(self._do_send_text(page, *args))
+            elif cmd == "scan_convs":
+                fut.set_result(page.evaluate(JS_LIST_CONVS))
+            elif cmd == "read_chat":
+                session = args[0]
+                page.evaluate(JS_CLICK_CONV, session)
+                time.sleep(1.0)
+                fut.set_result(page.evaluate(JS_READ_CHAT))
+            elif cmd == "get_state":
+                fut.set_result(page.evaluate(JS_PAGE_STATE))
+            elif cmd == "js_eval":
+                fut.set_result(page.evaluate(args[0]))
+            else:
                 fut.set_result(False)
+        except Exception as e:
+            self.log.error("命令 %s 执行异常: %s", cmd, repr(e))
+            fut.set_result(False)
 
     # ---------- 接收 ----------
     def _prime_seen(self, page):
@@ -418,24 +575,32 @@ class FeigeBridge:
     # ---------- 发送 ----------
     def _do_send_text(self, page, session, text):
         try:
-            # 1. 切到目标会话
-            ok = page.evaluate(JS_CLICK_CONV, session)
-            if not ok:
+            # 1. 切到目标会话（昵称可能重名，重名时宁可不发）
+            state = page.evaluate(JS_CLICK_CONV, session)
+            if state == "none":
                 self.log.error("未找到会话: %s", session)
+                return False
+            if isinstance(state, str) and state.startswith("ambiguous:"):
+                self.log.error(
+                    "昵称重复，拒绝发送以免发错人: %s (匹配 %s 个)",
+                    session, state.split(":", 1)[1],
+                )
                 return False
             time.sleep(1.2)
             # 2. 确认输入框 placeholder 指向该买家（防止切错）
-            ph = ""
-            try:
-                ph = page.evaluate("() => (document.querySelector('textarea')||{}).placeholder || ''")
-            except Exception:
-                pass
+            box = page.evaluate(JS_SEND_BOX) or {}
+            ph = box.get("placeholder", "") or ""
             if session not in ph:
                 self.log.warning("输入框指向可能不符 (ph=%s, want=%s)，重试一次", ph, session)
                 page.evaluate(JS_CLICK_CONV, session)
                 time.sleep(1.2)
+                box = page.evaluate(JS_SEND_BOX) or {}
+                ph = box.get("placeholder", "") or ""
+            if session not in ph:
+                self.log.error("输入框仍未指向目标会话 (ph=%s, want=%s)", ph, session)
+                return False
             # 3. 填文本 + 发送
-            ta = page.locator("textarea")
+            ta = page.locator("textarea").first
             ta.fill(str(text))
             time.sleep(0.3)
             btn = page.locator('[data-qa-id="qa-send-message-button"]')
@@ -444,6 +609,17 @@ class FeigeBridge:
             else:
                 ta.press("Enter")
             time.sleep(1.0)
+            # 4. 会话列表里该会话的最后一条预览应是这条文本，否则视为没发出去
+            head = str(text).replace("\n", " ")[:16]
+            preview = ""
+            for _ in range(6):
+                preview = page.evaluate(JS_LAST_SENT, session) or ""
+                if head and head in preview:
+                    break
+                time.sleep(0.5)
+            if not head or head not in preview:
+                self.log.error("发送后会话预览未见该消息 (preview=%r)", preview[:40])
+                return False
             self.log.info("已发送 -> [%s]: %s", session, text)
             return True
         except Exception as e:

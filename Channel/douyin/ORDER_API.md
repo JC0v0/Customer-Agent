@@ -8,14 +8,50 @@
 
 | 用途 | 方法 | 端点 | 状态 |
 |---|---|---|---|
-| 订单查询（主路径） | GET | `https://fxg.jinritemai.com/api/order/searchlist` | **实测可用** |
-| 订单详情（飞鸽域） | GET | `https://pigeon.jinritemai.com/backstage/getOrder` | 实测被风控，弃用 |
+| 订单查询（IM 主路径） | POST | `https://pigeon.jinritemai.com/backstage/cmpoent/order/query` | **2026-11-13 抓包确认页面在用** |
+| 订单查询（后台兜底） | GET | `https://fxg.jinritemai.com/api/order/searchlist` | **2026-11-12 实测可用** |
+| 订单详情（飞鸽域旧接口） | GET | `https://pigeon.jinritemai.com/backstage/getOrder` | 实测被风控，弃用 |
 | 按订单号反查买家 | GET | `https://pigeon.jinritemai.com/backstage/getuserbyorder` | 实测缺版本头，弃用 |
 
-主路径只需要抖店商家后台（fxg.jinritemai.com）的登录 cookie；
-纯 HTTP + cookie 即可调用，**不需要** a_bogus / msToken 等风控签名（实测确认）。
+查询顺序：**IM 接口 → 后台 searchlist → 会话里的订单号骨架**。
 
-## 2. searchlist（主路径，实测通过）
+之所以把 IM 接口放第一位：它和消息通道共用飞鸽 cookie（按账号隔离的
+`dy_session_<hash>.json` 里的 `cookies_full`，早期是全局 `dy_session_live.json`），
+买家一进线就有凭据可用；而 searchlist 要的是
+`fxg.jinritemai.com` 域的会话，登录时没打开过抖店后台就拿不到。
+
+## 2. IM 订单接口（主路径，2026-11-13 抓包）
+
+```
+POST https://pigeon.jinritemai.com/backstage/cmpoent/order/query
+```
+
+- 路径里的 `cmpoent` 是**服务端真实拼写**（不是 component），改了会 404。
+- 请求头要带 IM 页面的 referer：`https://im.jinritemai.com/pc_seller_v2/main/workspace`。
+  用 fxg 的 referer 会被按跨站请求拒掉。
+- 鉴权：飞鸽域 cookie，与消息接收/发送同一份登录态。
+
+响应（真实抓包，金额单位分）：
+
+```json
+{"check_spam_resp": {...},
+ "order_info": {
+   "order_id": "69194...", "order_status": 3, "order_status_desc": "已发货",
+   "order_type_desc": "普通订单", "create_time": 1794303361, "pay_time": 1794303400,
+   "actual_pay_amount": 12980, "seller_price": 12980, "pay_type_desc": "支付宝",
+   "full_address": "贵州省 贵阳市 …", "mobile": "138****5678",
+   "buyer_words": "", "order_remark": "",
+   "logistics_info": {"tracking_no": "...", "express_company": "申通快递"},
+   "sku_order_list": [{"product_id": "...", "product_name": "...", "count": 2}]}}
+```
+
+请求体：该接口是页面内部接口，没有对外文档，抓包只留下了响应。
+实现里按候选形态依次试探（`IM_BODY_STYLES`）：`{"order_id"}` →
+`{"order_id","biz_type":4}` → `{"data":{"order_id"}}` → `{"order_id","cid"}`，
+命中后记住形态，不再重复试探；四种都失败则冷却 10 分钟并退回后台接口。
+若确认了服务端真实请求体，把 `IM_BODY_STYLES` 收敛成那一种即可。
+
+## 3. searchlist（后台兜底，实测通过）
 
 ```
 GET https://fxg.jinritemai.com/api/order/searchlist
@@ -75,16 +111,16 @@ GET https://fxg.jinritemai.com/api/order/searchlist
 | `combo_num` / `combo_amount` / `pay_amount` | 数量 / 金额（分） |
 | `sku_order_status_info.order_status_text` | 子单状态文案 |
 
-## 3. 飞鸽域接口实测结论（均不可用，勿再尝试）
+## 4. 飞鸽域其它订单接口（均不可用，勿再尝试）
 
 | 接口 | 实测响应 | 结论 |
 |---|---|---|
-| `/backstage/getOrder` | `{"code":"10001010A","msg":"当前环境存在风险，请稍后重试"}` | 字节风控签名体系（a_bogus），有头/无头浏览器、context.request、页内 fetch 三种方式全部被拦 |
+| `/backstage/getOrder` | `{"code":"10001010A","msg":"当前环境存在风险，请稍后重试"}` | 字节风控签名体系（a_bogus），有头/无头浏览器、context.request、页内 fetch 三种方式全部被拦。**注意它与 §2 的 `cmpoent/order/query` 不是同一个接口**，后者是 IM 页面自己在用的，不受此限制 |
 | `/backstage/getuserbyorder` | `{"code":11001,"msg":"飞鸽版本过低，浏览器用户请刷新页面"}` | 服务端校验飞鸽客户端版本标识，纯 HTTP 无法绕过 |
 
 客服场景的「按买家查订单」改用 searchlist 的 `buyer` 参数实现（见 §3.1）。
 
-### 3.1 会话买家 ↔ 订单的关联链路（2026-11-12 深挖实测）
+### 4.1 会话买家 ↔ 订单的关联链路（2026-11-12 深挖实测）
 
 结论：**只有「真实昵称」这一条关联键是通的**，其余全部实测否定。
 
@@ -116,7 +152,7 @@ GET https://fxg.jinritemai.com/api/order/searchlist
 `extract_buyer_nick_from_ext(ext)` 从消息 ext 提取真实昵称（排除占位值），
 `extract_card_order_ids(message_body)` 从卡片消息提取订单号。
 
-### 3.2 物流字段（schema 实测，内容待发货订单验证）
+### 4.2 物流字段（schema 实测，内容待发货订单验证）
 
 订单行的物流字段（待发货订单实测，全部为空）：
 
@@ -132,14 +168,18 @@ GET https://fxg.jinritemai.com/api/order/searchlist
 （验证用的测试订单未发货）。轨迹明细如果 `track` 字段不够用，
 可能还有独立的物流详情接口，未探查。
 
-## 4. 鉴权与 cookie 要求
+## 5. 鉴权与 cookie 要求
 
-- 需要 `fxg.jinritemai.com` 域的登录 cookie（抖店商家后台）。
+- IM 接口（§2）用飞鸽域 cookie，即登录态文件里的 `cookies_full`，与消息通道同一份。
+  登录态文件自 2026-11 起**按账号隔离**（`temp/dy_session_<hash>.json`，见
+  `Channel/douyin/session_paths.py`），订单模块统一用 `existing_pigeon_session_path()`
+  解析，不要写死文件名。
+- searchlist（§3）需要 `fxg.jinritemai.com` 域的登录 cookie（抖店商家后台）。
 - 登录流程（`douyin_login.py`）抓取的是**全浏览器 cookie**（`page.context.cookies()`），
   若登录时抖店后台也在同一浏览器登录过，cookies_full 天然包含 fxg 域会话。
 - 若抖店后台未登录，searchlist 返回未登录（`st != 0`），实现走消息历史骨架兜底。
 
-## 5. 已知限制
+## 6. 已知限制
 
 1. **金额单位是分**，实现里统一除以 100 转成元。
 2. `buyer` 参数按**真实昵称精确匹配**：昵称改过、或买家改用新昵称后查不到；
@@ -154,7 +194,7 @@ GET https://fxg.jinritemai.com/api/order/searchlist
 5. 物流字段 schema 已确认，但有货在途数据时的内容结构未验证。
 6. 售后状态、优惠明细字段（`promotion_detail` 等）未接入。
 
-## 6. 回退策略
+## 7. 回退策略
 
 真实接口失败（未登录 / 风控 / 网络 / 订单不存在）时，回退到会话消息历史里
 正则提取订单号（15-25 位数字），返回只含订单号的骨架，`source` 标为

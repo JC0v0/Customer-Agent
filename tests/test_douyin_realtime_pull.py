@@ -44,7 +44,6 @@ def make_mixin(dispatch, stop):
     mixin.logger = mock.MagicMock()
     mixin._stop_event = stop
     mixin._dispatch_pigeon_event = dispatch
-    mixin._mark_handoff_by_merchant = mock.MagicMock()
     return mixin
 
 
@@ -65,7 +64,7 @@ def buyer_message(**overrides):
     """v3 接口里真实买家消息的形态：biz=Buyer，sender_role 为空。"""
     message = {
         "type": 1000,
-        "conv_id": "7680792019895125267",
+        "conv_id": "1000000000000000001",
         "msg_id": "buyer-msg-1",
         "text": "有人吗",
         "ts": int(time.time() * 1e6) - 240 * 10 ** 6,
@@ -282,45 +281,19 @@ class TestBaseline(unittest.IsolatedAsyncioTestCase):
             "queue", None,
         )
 
-        state = transport.conv_state["7680792019895125267"]
+        state = transport.conv_state["1000000000000000001"]
         self.assertEqual(state["security_receiver_id"], "buyer-secret-1")
         self.assertEqual(state["shop_id"], "123456789")
         self.assertEqual(state["talk_id"], "7706578658005222691")
 
 
-class TestHandoffByMerchant(unittest.IsolatedAsyncioTestCase):
-    async def test_agent_message_marks_handoff(self):
+class TestMerchantMessagesNotDispatched(unittest.IsolatedAsyncioTestCase):
+    """商家侧消息不派发：不回复、不转人工（与拼多多一致）。"""
+
+    async def _run_once(self, message):
         stop = FakeStop()
-        mixin = make_mixin(mock.AsyncMock(), stop)
-        rounds = {"n": 0}
-
-        def fetch(since_us):
-            rounds["n"] += 1
-            # 第一轮是启动基线（静默），第二轮才出现人工回复。
-            if rounds["n"] == 1:
-                return []
-            stop.set()
-            return [{
-                "type": 1000,
-                "conv_id": "conv-1",
-                "text": "我来帮您处理",
-                "ts": int(time.time() * 1e6),
-                "sender_biz_role": "CurrentServer",
-                "sender_role": "2",
-                "client_message_id": "human-uuid",
-            }]
-
-        await mixin._pigeon_http_pull_loop(
-            make_http(fetch), make_transport(), set(), "shop-1", "user-1",
-            "name", "queue", None,
-        )
-
-        self.assertEqual(mixin._mark_handoff_by_merchant.call_count, 1)
-
-    async def test_ai_reply_does_not_mark_handoff(self):
-        """本程序 AI 的回复以 role=4 + Shop 回流，不能把自己判成人工。"""
-        stop = FakeStop()
-        mixin = make_mixin(mock.AsyncMock(), stop)
+        dispatch = mock.AsyncMock()
+        mixin = make_mixin(dispatch, stop)
         rounds = {"n": 0}
 
         def fetch(since_us):
@@ -328,29 +301,16 @@ class TestHandoffByMerchant(unittest.IsolatedAsyncioTestCase):
             if rounds["n"] == 1:
                 return []
             stop.set()
-            return [{
-                "type": 1000,
-                "conv_id": "conv-1",
-                "text": "在的～您想了解哪方面呢",
-                "ts": int(time.time() * 1e6),
-                "sender_biz_role": "Shop",
-                "sender_role": "4",
-                "client_message_id": "llm_process_text_2_abc",
-            }]
+            return [dict(message)]
 
         await mixin._pigeon_http_pull_loop(
             make_http(fetch), make_transport(), set(), "shop-1", "user-1",
             "name", "queue", None,
         )
+        return dispatch
 
-        self.assertEqual(mixin._mark_handoff_by_merchant.call_count, 0)
-
-    async def test_same_merchant_message_marks_handoff_once(self):
-        """游标每轮回退 5 秒，同一条人工回复会被反复读到，只算一次介入。"""
-        stop = FakeStop()
-        mixin = make_mixin(mock.AsyncMock(), stop)
-        rounds = {"n": 0}
-        human = {
+    async def test_human_cs_message_is_not_dispatched(self):
+        dispatch = await self._run_once({
             "type": 1000,
             "conv_id": "conv-1",
             "text": "我来帮您处理",
@@ -358,55 +318,33 @@ class TestHandoffByMerchant(unittest.IsolatedAsyncioTestCase):
             "sender_biz_role": "CurrentServer",
             "sender_role": "2",
             "client_message_id": "human-uuid",
-        }
+        })
+        self.assertEqual(dispatch.call_count, 0)
 
-        def fetch(since_us):
-            rounds["n"] += 1
-            if rounds["n"] == 1:
-                return []
-            if rounds["n"] >= 5:
-                stop.set()
-            return [dict(human)]
+    async def test_system_close_notice_is_not_dispatched(self):
+        """系统关闭提示 f6=1005，角色字段和人工一样。"""
+        dispatch = await self._run_once({
+            "type": 1005,
+            "conv_id": "conv-1",
+            "text": "您超时未回复，系统关闭会话",
+            "ts": int(time.time() * 1e6),
+            "sender_biz_role": "CurrentServer",
+            "sender_role": "2",
+            "client_message_id": "close_non_process_7707670112412730662",
+        })
+        self.assertEqual(dispatch.call_count, 0)
 
-        await mixin._pigeon_http_pull_loop(
-            make_http(fetch), make_transport(), set(), "shop-1", "user-1",
-            "name", "queue", None,
-        )
-
-        self.assertEqual(mixin._mark_handoff_by_merchant.call_count, 1)
-
-    async def test_baseline_merchant_history_does_not_mark_handoff(self):
-        """启动前已有的人工回复属于历史，不能一启动就转人工。
-
-        回归点：基线只把历史塞进 seen_msg 挡住买家消息，商家侧没有查
-        这个集合，于是上一轮 AI 的回复会被当成本次人工介入，会话直接静默。
-        """
-        stop = FakeStop()
-        mixin = make_mixin(mock.AsyncMock(), stop)
-        history = [{
+    async def test_shop_robot_message_is_not_dispatched(self):
+        dispatch = await self._run_once({
             "type": 1000,
             "conv_id": "conv-1",
-            "text": "您可以关注店铺有新货上架时会第一时间通知您",
-            "ts": int(time.time() * 1e6) - 600 * 10 ** 6,
-            "sender_biz_role": "CurrentServer",
-            "sender_role": "",
-            "client_message_id": "240acc9f-b874-4f9c-a674-cde8c33ba4ef",
-        }]
-        rounds = {"n": 0}
-
-        def fetch(since_us):
-            rounds["n"] += 1
-            # 基线一轮，之后又因为 5 秒重叠把同一条历史再返回一次。
-            if rounds["n"] >= 3:
-                stop.set()
-            return [dict(history[0])]
-
-        await mixin._pigeon_http_pull_loop(
-            make_http(fetch), make_transport(), set(), "shop-1", "user-1",
-            "name", "queue", None,
-        )
-
-        self.assertEqual(mixin._mark_handoff_by_merchant.call_count, 0)
+            "text": "在的～您想了解哪方面呢",
+            "ts": int(time.time() * 1e6),
+            "sender_biz_role": "Shop",
+            "sender_role": "4",
+            "client_message_id": "llm_process_text_2_abc",
+        })
+        self.assertEqual(dispatch.call_count, 0)
 
 
 class TestPullFailure(unittest.IsolatedAsyncioTestCase):

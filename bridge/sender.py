@@ -56,19 +56,58 @@ class PinduoduoSender(ReplySender):
         return SendMessage(str(shop_id), str(user_id)).move_conversation(recipient_uid, cs_uid)
 
 
+class DouyinSender(ReplySender):
+    """抖音发送器，封装 douyin SendMessage。
+
+    抖音的 SendMessage 内部自己做三级降级：pigeon 纯协议（HTTP → WS）→
+    浏览器桥。这里只做转发，不重复实现降级，也不吞异常，让上层看到真实原因。
+    """
+
+    def send_text(self, shop_id, user_id, recipient_uid, text):
+        from Channel.douyin.utils.API.send_message import SendMessage
+        return SendMessage(str(shop_id), str(user_id)).send_text(recipient_uid, text)
+
+    def send_image(self, shop_id, user_id, recipient_uid, image_url):
+        from Channel.douyin.utils.API.send_message import SendMessage
+        return SendMessage(str(shop_id), str(user_id)).send_image(recipient_uid, image_url)
+
+    def send_product_card(self, shop_id, user_id, recipient_uid, goods_id, biz_type=2):
+        from Channel.douyin.utils.API.send_message import SendMessage
+        return SendMessage(str(shop_id), str(user_id)).send_mallGoodsCard(recipient_uid, goods_id, biz_type)
+
+    def get_cs_list(self, shop_id, user_id):
+        from Channel.douyin.utils.API.send_message import SendMessage
+        return SendMessage(str(shop_id), str(user_id)).getAssignCsList()
+
+    def transfer_to_cs(self, shop_id, user_id, recipient_uid, cs_uid):
+        from Channel.douyin.utils.API.send_message import SendMessage
+        return SendMessage(str(shop_id), str(user_id)).move_conversation(recipient_uid, cs_uid)
+
+
 # 渠道 -> 发送器 注册表
 _SENDERS = {
     ChannelType.PINDUODUO: PinduoduoSender(),
+    ChannelType.DOUYIN: DouyinSender(),
 }
 
 
 def get_sender(channel_type=None) -> Optional[ReplySender]:
     """获取指定渠道的发送器。
 
-    channel_type 为 None 或未注册时，回退到默认渠道（拼多多，当前唯一渠道）。
+    历史行为：channel_type 为 None 时回退默认渠道（拼多多）。这条对无参
+    调用的老工具保持兼容。
+
+    但**明确传入**的渠道绝不再静默回退拼多多：抖音会话曾因此把回复交给
+    拼多多 SendMessage，日志报「未找到店铺: douyin_xxx (渠道: pinduoduo)」，
+    消息直接发不出去。未注册的渠道改为返回 None，由调用方记录「无可用发送器」。
     """
-    if channel_type is not None:
-        ct = channel_type if isinstance(channel_type, ChannelType) else ChannelType(str(channel_type))
-        if ct in _SENDERS:
-            return _SENDERS[ct]
-    return _SENDERS.get(ChannelType.PINDUODUO)
+    if channel_type is None:
+        return _SENDERS.get(ChannelType.PINDUODUO)
+    if isinstance(channel_type, ChannelType):
+        return _SENDERS.get(channel_type)
+    try:
+        ct = ChannelType(str(channel_type))
+    except ValueError:
+        # 无法识别的字符串仍按历史行为回退，避免影响既有调用方
+        return _SENDERS.get(ChannelType.PINDUODUO)
+    return _SENDERS.get(ct)

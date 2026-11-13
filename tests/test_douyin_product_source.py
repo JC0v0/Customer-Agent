@@ -1,5 +1,7 @@
 """Regression coverage for live Douyin product collection and KB isolation."""
 import asyncio
+import json
+from pathlib import Path
 from unittest import mock
 
 from Channel.douyin.douyin_login import DouyinLogin
@@ -114,3 +116,78 @@ def test_product_manager_never_opens_browser_for_ai_queries():
 
     assert result["success"] is True
     source.fetch_product_list.assert_not_called()
+
+
+class _RecordingClient:
+    """只记录 CDP 调用，不真的连浏览器。"""
+
+    def __init__(self, evaluate_value=None):
+        self.calls = []
+        self._evaluate_value = evaluate_value
+
+    def call(self, method, params=None, timeout=None):
+        self.calls.append((method, params))
+        if method == "Runtime.evaluate":
+            return {"result": {"value": self._evaluate_value}}
+        return {}
+
+
+def _source(tmp_path):
+    return DouyinProductSource(
+        "douyin_shop", "uid", profile_dir=tmp_path / "profile",
+        browser_path=tmp_path / "msedge.exe",
+    )
+
+
+def test_merchant_cookies_are_injected_on_parent_domain(tmp_path):
+    """登录态必须按 .jinritemai.com 注入。
+
+    用 url= 交给 CDP 推断会写成 host-only cookie，抖店 SSO 跳转链上的
+    sso.jinritemai.com 读不到，页面落到 /login/common；而未登录时 list
+    接口仍返回 code=0 空列表，表现为「同步成功 0 个商品」（2026-11-13 实测）。
+    """
+    session_file = tmp_path / "dy_session_x.json"
+    session_file.write_text(
+        json.dumps({"cookies_full": {"sessionid": "abc", "sid_guard": "def"}}),
+        encoding="utf-8",
+    )
+    client = _RecordingClient()
+
+    with mock.patch("database.db_manager") as db, mock.patch(
+        "Channel.douyin.session_paths.existing_pigeon_session_path",
+        return_value=session_file,
+    ):
+        db.get_account.return_value = {"username": ""}
+        injected = _source(tmp_path)._inject_session_cookies(client)
+
+    assert injected == 2
+    method, params = client.calls[0]
+    assert method == "Network.setCookies"
+    for entry in params["cookies"]:
+        assert entry["domain"] == ".jinritemai.com"
+        assert "url" not in entry
+
+
+def test_login_page_detection_reads_location_path(tmp_path):
+    landed = _RecordingClient(evaluate_value="/login/common")
+    product_page = _RecordingClient(evaluate_value="/ffa/g/list")
+
+    source = _source(tmp_path)
+    assert source._landed_on_login(landed) is True
+    assert source._landed_on_login(product_page) is False
+
+
+def test_expired_login_is_reported_instead_of_zero_products(tmp_path):
+    """登录态失效不能报成「读取成功 0 个商品」。"""
+    source = _source(tmp_path)
+    message = source._failure_message(ValueError("merchant_login_required"))
+    assert "重新登录" in message
+
+
+def test_product_page_browser_is_killed_as_process_tree():
+    """Edge 是多进程的，terminate 只杀启动器，窗口会留在桌面上。"""
+    source_text = Path("Channel/douyin/utils/API/product_source.py").read_text(
+        encoding="utf-8"
+    )
+    assert "kill_process_tree" in source_text
+    assert "process.terminate()" not in source_text

@@ -119,6 +119,83 @@ class PackagingSpecTest(unittest.TestCase):
             "collect_data_files 将收集不到它",
         )
 
+    def _collect_submodule_targets(self):
+        """收集 collect_submodules 的目标包名。
+
+        spec 里用 `for _pkg in (...): collect_submodules(_pkg)` 批量收集，
+        所以除了直接传字面量的调用，还要把 for 循环遍历的常量也算进来。
+        """
+        targets = []
+        for call in self.calls_in("collect_submodules"):
+            arg = call.args[0] if call.args else None
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                targets.append(arg.value)
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.For) and isinstance(node.iter, (ast.Tuple, ast.List)):
+                for elt in node.iter.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        targets.append(elt.value)
+        return targets
+
+    def test_douyin_channel_is_collected(self):
+        """抖音渠道必须整体进包。
+
+        回归背景：hiddenimports 里只列了 Channel.pinduoduo.*，抖音接入后没补，
+        发布包里没有 Channel.douyin，表现为「界面能加抖音账号，一启动就连不上」，
+        而源码运行完全正常——这类缺陷在测试里不体现，只能在打包配置上卡住。
+        """
+        collected = self._collect_submodule_targets()
+        self.assertIn(
+            "Channel.douyin",
+            collected,
+            "spec 里缺少 collect_submodules('Channel.douyin')，打出来的包不含抖音渠道",
+        )
+        self.assertIn(
+            "tools.reverse_probe.douyin",
+            collected,
+            "缺少 tools.reverse_probe.douyin：打包版收不到买家消息、取不到会话订单号",
+        )
+
+    def test_douyin_skeleton_assets_are_collected(self):
+        """抖音 pigeon 脱敏骨架必须进包（「下载即用」的兜底依赖）。
+
+        新机器没有手工抓包文件时，发送帧/接收 body 靠包内骨架兜底。
+        骨架没进包时回退静默失效，表现为冻结版抖音通道永远起不来。
+        """
+        for name in ("pigeon_send_frame.json", "pigeon_usermsg_body.json"):
+            self.assertIn(
+                name, self.source,
+                f"spec datas 里缺少抖音骨架资产 {name}",
+            )
+        self.assertIn(
+            "Channel/douyin/assets", self.source,
+            "骨架必须放进 Channel/douyin/assets 目标目录，"
+            "pigeon_assets.py 按 get_resource_path('Channel/douyin/assets/...') 定位",
+        )
+
+    def test_channel_hidden_modules_reach_analysis(self):
+        """收集到的渠道模块必须真的并进 Analysis 的 hiddenimports。"""
+        analysis = [
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "Analysis"
+        ]
+        self.assertTrue(analysis, "spec 里找不到 Analysis 调用")
+        hidden = None
+        for keyword in analysis[0].keywords:
+            if keyword.arg == "hiddenimports":
+                hidden = keyword.value
+        self.assertIsNotNone(hidden, "Analysis 缺少 hiddenimports 参数")
+        names = {
+            getattr(node, "id", None)
+            for node in ast.walk(hidden)
+            if isinstance(node, ast.Name)
+        }
+        self.assertIn(
+            "_channel_hidden", names,
+            "hiddenimports 未包含 _channel_hidden，抖音渠道模块不会进包",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

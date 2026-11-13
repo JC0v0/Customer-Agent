@@ -110,14 +110,15 @@ def _get_merchant_creds(shop_id, user_id) -> tuple:
 
 def _query_douyin_orders(params) -> str:
     """
-    抖音订单查询：真实抖店后台订单接口（2026-11-12 逆向实测）。
+    抖音订单查询：飞鸽 IM 订单接口优先（2026-11-13），后台接口兜底。
 
-    数据源：fxg.jinritemai.com/api/order/searchlist（纯 HTTP + cookie，
-    无需 a_bogus/msToken）。查询三级策略：
+    数据源：pigeon.jinritemai.com/backstage/cmpoent/order/query（IM 页面同款，
+    与消息通道共用飞鸽 cookie，买家进线即可查），失败退到
+    fxg.jinritemai.com/api/order/searchlist（需要抖店后台 cookie）。查询策略：
       1. order_sn 订单号精确查（买家主动报单号）
       2. buyer_nick 真实昵称反查（服务端精确匹配；掩码/前缀查不到，
-         实测见 Channel/douyin/ORDER_API.md §3.1）
-      3. 消息历史提取订单号 → 按单号补详情（兜底）
+         实测见 Channel/douyin/ORDER_API.md §4.1）
+      3. 会话里的订单卡片/订单号 → 按单号补详情（买家进线实时查询）
     - 有订单 → 格式化返回（订单号/状态/物流，格式与拼多多一致）
     - 无订单 → 返回引导话术
     - 不调拼多多 API/浏览器（渠道隔离）

@@ -197,9 +197,10 @@ class TransportPayloadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ResponseFormatCompatibilityTests(unittest.TestCase):
-    def _payload(self, provider=LLMProvider.VOLCENGINE, response_format=None):
+    def _payload(self, provider=LLMProvider.VOLCENGINE, response_format=None,
+                 model="doubao-seed-2.1-turbo"):
         return transport.build_chat_payload(
-            _profile(provider, "doubao-seed-2.1-turbo"),
+            _profile(provider, model),
             [{"role": "user", "content": "Return JSON"}],
             use_tools=False,
             response_format=response_format or {"type": "json_object"},
@@ -239,13 +240,36 @@ class ResponseFormatCompatibilityTests(unittest.TestCase):
         self.assertNotIn("secret-key", str(logger.mock_calls))
         logger.warning.assert_called_once()
 
-    def test_other_providers_are_not_given_an_unverified_passthrough(self):
+    def test_any_provider_missing_capability_entry_uses_extra_body(self):
+        """能力表缺 response_format 时，任何供应商都要走 extra_body。
+
+        LiteLLM 的能力表落后于供应商实际能力：智谱 glm 系列支持 json_object，
+        但 zai 表里没有，请求被本地拦下（2026-11-13 真机：商品知识提取每次
+        UnsupportedParamsError，全部降级）。只给火山开这个口子修不了问题。
+        """
         sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=[]))
         with mock.patch.object(transport, "litellm", sdk):
             payload = self._payload(LLMProvider.DEEPSEEK)
-        self.assertIn("response_format", payload)
-        self.assertNotIn("extra_body", payload)
-        sdk.get_supported_openai_params.assert_not_called()
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(payload["extra_body"]["response_format"], {"type": "json_object"})
+        sdk.get_supported_openai_params.assert_called_once_with(
+            model="doubao-seed-2.1-turbo", custom_llm_provider="deepseek"
+        )
+
+    def test_zhipu_glm_json_object_uses_extra_body(self):
+        """复现本次故障：zai 能力表不含 response_format，必须改走 extra_body。"""
+        zai_params = [
+            "max_tokens", "stream", "stream_options", "temperature",
+            "top_p", "stop", "tools", "tool_choice",
+        ]
+        sdk = SimpleNamespace(get_supported_openai_params=mock.Mock(return_value=zai_params))
+        with mock.patch.object(transport, "litellm", sdk):
+            payload = self._payload(LLMProvider.ZHIPU, model="glm-4-flash")
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(payload["extra_body"]["response_format"], {"type": "json_object"})
+        sdk.get_supported_openai_params.assert_called_once_with(
+            model="glm-4-flash", custom_llm_provider="zai"
+        )
 
     def test_json_schema_is_not_silently_treated_as_json_object(self):
         schema = {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object"}}}

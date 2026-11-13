@@ -573,7 +573,18 @@ class KnowledgeService:
         )
 
     def get_all_shops(self) -> List[Shop]:
-        """获取所有店铺列表（用于UI选择器）"""
+        """获取所有店铺列表（用于UI选择器）。
+
+        多平台下同名店铺很多（「示例店铺」同时存在于拼多多和抖音），UI 需要在
+        下拉里显示渠道才能区分，这里预加载 channel 关系，避免 session 关闭后
+        再访问 shop.channel 触发懒加载异常（DetachedInstanceError）。
+        """
         with self.get_session() as session:
-            stmt = select(Shop).order_by(Shop.shop_name.asc())
-            return list(session.scalars(stmt))
+            from sqlalchemy.orm import joinedload
+
+            stmt = (
+                select(Shop)
+                .options(joinedload(Shop.channel))
+                .order_by(Shop.shop_name.asc())
+            )
+            return list(session.scalars(stmt).unique())

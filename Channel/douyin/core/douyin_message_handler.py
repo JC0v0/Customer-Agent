@@ -169,7 +169,8 @@ class MessageHandlerMixin:
             message_data = json.loads(message)
             msg_type = message_data.get("message", {}).get("type", "unknown")
             self.logger.debug(
-                f"received message: type={msg_type}, shop_id={shop_id}"
+                f"received message: channel=douyin, type={msg_type}, "
+                f"shop_id={shop_id}"
             )
 
             # TODO(传输缝): 抖音真实消息帧格式未知，DouyinChatMessage 的字段解析
@@ -331,15 +332,14 @@ class MessageHandlerMixin:
             if not context:
                 return
             self.logger.debug(
-                f"pigeon 消息 -> context: conv={conv_id}, content={content!r}"
+                f"pigeon 消息 -> context: conv={conv_id}, "
+                f"content_len={len(str(content or ''))}"
             )
             if self._should_process_immediately(context):
                 await self._handle_immediate_message(context, shop_id, user_id)
             elif self._should_queue_message(context):
-                msg_id = await self.queue_manager.get_or_create_queue(queue_name).put(context)
-                self.logger.debug(
-                    f"pigeon 消息入队: {queue_name}, msg_id={msg_id}, type={context.type}"
-                )
+                # 入队日志由队列层统一打（Message enqueued），这里不再重复
+                await self.queue_manager.get_or_create_queue(queue_name).put(context)
         except Exception as exc:
             self.logger.error(
                 f"pigeon 消息处理失败: error_type={type(exc).__name__}, exc={exc}"

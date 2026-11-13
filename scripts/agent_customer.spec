@@ -71,6 +71,15 @@ _pw_node = [
 ]
 _pw_binaries = list(_pw_binaries) + _pw_node
 
+# 抖音渠道：原来 hiddenimports 是一个个手写的，只写到了拼多多，
+# 抖音接入后没人补，打出来的包界面里能加账号、但一启动就连不上飞鸽
+# （Channel.douyin 整个不在包里）。改为按包整体收集，新增子模块不会再漏。
+# tools.reverse_probe.douyin 是消息接收、昵称反查、会话订单号提取的依据，
+# 同样必须进包，否则打包版收不到买家消息、也定位不到会话。
+_channel_hidden = []
+for _pkg in ("Channel.douyin", "tools.reverse_probe.douyin"):
+    _channel_hidden.extend(collect_submodules(_pkg))
+
 # ================================
 # 基础配置
 # ================================
@@ -82,6 +91,13 @@ a = Analysis(
         # 图标文件
         (str(PROJECT_ROOT / "icon" / "icon.ico"), "icon"),
         (str(PROJECT_ROOT / "icon" / "Customer-Agent-qr.png"), "icon"),
+        # 抖音 pigeon 脱敏骨架（不含任何凭据，随包分发）：
+        # 新机器没有抓包文件时，开会话帧/发送帧/接收 body 用它兜底，
+        # 握手/注册帧由登录流程自动录帧补齐。
+        (str(PROJECT_ROOT / "Channel" / "douyin" / "assets" / "pigeon_start_frame.json"), "Channel/douyin/assets"),
+        (str(PROJECT_ROOT / "Channel" / "douyin" / "assets" / "pigeon_enter_frame.json"), "Channel/douyin/assets"),
+        (str(PROJECT_ROOT / "Channel" / "douyin" / "assets" / "pigeon_send_frame.json"), "Channel/douyin/assets"),
+        (str(PROJECT_ROOT / "Channel" / "douyin" / "assets" / "pigeon_usermsg_body.json"), "Channel/douyin/assets"),
     ] + _pw_datas + _llm_datas,
     hiddenimports=[
         # === PyQt6 & Fluent Widgets ===
@@ -204,6 +220,12 @@ a = Analysis(
         "utils.resource_manager",
         "utils.path_utils",
         "utils.runtime_path",
+        # Win32 进程清理（app 启动清孤儿 / 登录前后清占 profile 的浏览器）。
+        # 全是函数内延迟导入，显式登记避免打包后 ImportError 导致清理静默失效。
+        "utils.win_process",
+        # 店铺 logo 加载（账号卡片 / 自动回复卡片共用）。函数内延迟导入，
+        # 显式登记避免漏收导致打包后点开账号页就 ImportError。
+        "ui.logo_helper",
         "utils.secret_store",
         # === 避免 pydantic v1/v2 冲突 ===
         "pydantic.errors",
@@ -231,7 +253,7 @@ a = Analysis(
         # === httpx (for openai) ===
         "httpx",
         "httpcore",
-    ] + _pw_hidden + _llm_hidden,
+    ] + _pw_hidden + _llm_hidden + _channel_hidden,
     hookspath=[],
     hooksconfig={},
     keys=block_cipher,

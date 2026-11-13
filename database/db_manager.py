@@ -44,10 +44,18 @@ class DatabaseManager:
         self.init_db()
 
     def init_db(self):
-        """初始化渠道信息"""
-        channel_name = "pinduoduo"
-        description = "拼多多"
-        self.add_channel(channel_name, description)
+        """初始化渠道信息（每次启动幂等补齐）
+
+        这里必须把已支持的全部渠道登记上：add_shop / add_account 都先按
+        channel_name 查 channels 表，查不到就直接返回 False。抖音接进来后
+        这里漏登记，表现就是「添加抖音账号 → 登录成功 → 提示数据写入失败」。
+        """
+        channels = (
+            ("pinduoduo", "拼多多"),
+            ("douyin", "抖音"),
+        )
+        for channel_name, description in channels:
+            self.add_channel(channel_name, description)
 
 
     def get_session(self):

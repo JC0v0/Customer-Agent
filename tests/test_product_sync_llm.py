@@ -16,7 +16,18 @@ from database.knowledge_service import KnowledgeService
 from database.models import Base, Channel, Shop, ProductKnowledge
 from database.product_sync import ProductSyncService, SyncProgress
 from utils.llm_provider import LLMProfile, LLMProvider
-from utils.llm_transport import NormalizedResponse
+from utils.llm_transport import (
+    LLMErrorCategory,
+    LLMTransportError,
+    NormalizedResponse,
+)
+
+
+def _parameter_error():
+    return LLMTransportError(
+        LLMErrorCategory.PARAMETER, "模型请求参数不被当前供应商接受",
+        provider="zhipu", model_name="glm-4-flash",
+    )
 
 
 def profile():
@@ -65,6 +76,77 @@ class ProductSyncTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(succeeded)
         self.assertIn("Item", result)
         self.assertNotIn("secret-key", result + str(logger.mock_calls))
+
+    async def test_rejected_image_retries_once_without_image(self):
+        """纯文本模型收到图片会报参数类错误，应去掉图片重试一次。
+
+        2026-11-13 真机：glm-4-flash 是纯文本模型，商品带缩略图时整个知识
+        提取直接降级成基本信息。商品知识主体来自文字，缺图仍可提取。
+        """
+        ok_response = NormalizedResponse('{"brand":"Brand"}', [], {}, object())
+        attempts = []
+
+        async def fake_completion(profile_arg, messages, **kwargs):
+            attempts.append(copy.deepcopy(messages))
+            if len(attempts) == 1:
+                raise _parameter_error()
+            return ok_response
+
+        with mock.patch("database.product_sync.async_completion", new=fake_completion):
+            result, succeeded = await self._service()._extract_product_knowledge(
+                {"goods_name": "Item", "price": "9.9",
+                 "thumb_url": "https://img.test/item.jpg"},
+                {"specifications": []}, profile=profile(),
+            )
+
+        self.assertTrue(succeeded)
+        self.assertIn("Brand", result)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0][1]["content"][1]["type"], "image_url")
+        self.assertFalse(
+            any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in attempts[1][1]["content"]
+            )
+        )
+
+    async def test_non_parameter_error_does_not_retry(self):
+        """限流/连接类错误重试图片没有意义，不该多打一次请求。"""
+        attempts = []
+
+        async def fake_completion(profile_arg, messages, **kwargs):
+            attempts.append(messages)
+            raise LLMTransportError(
+                LLMErrorCategory.RATE_LIMIT, "模型请求受到限流",
+                provider="zhipu", model_name="glm-4-flash",
+            )
+
+        with mock.patch("database.product_sync.async_completion", new=fake_completion):
+            _result, succeeded = await self._service()._extract_product_knowledge(
+                {"goods_name": "Item", "price": "9.9",
+                 "thumb_url": "https://img.test/item.jpg"},
+                {"specifications": []}, profile=profile(),
+            )
+
+        self.assertFalse(succeeded)
+        self.assertEqual(len(attempts), 1)
+
+    async def test_text_only_request_failure_does_not_retry(self):
+        """没有图片的消息失败时不该重试，避免把一次失败变成两次请求。"""
+        attempts = []
+
+        async def fake_completion(profile_arg, messages, **kwargs):
+            attempts.append(messages)
+            raise _parameter_error()
+
+        with mock.patch("database.product_sync.async_completion", new=fake_completion):
+            _result, succeeded = await self._service()._extract_product_knowledge(
+                {"goods_name": "Item", "price": "9.9"},
+                {"specifications": []}, profile=profile(),
+            )
+
+        self.assertFalse(succeeded)
+        self.assertEqual(len(attempts), 1)
 
     async def test_missing_profile_keeps_basic_info_fallback(self):
         service = self._service()

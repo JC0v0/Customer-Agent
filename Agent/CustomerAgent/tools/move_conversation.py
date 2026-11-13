@@ -15,6 +15,7 @@ logger = get_logger("TransferConversationTool")
 
 class TransferConversationParams(BaseModel):
     """会话转接参数"""
+    channel_type: Optional[str] = Field(default=None, description="渠道类型（受信任注入）")
     shop_id: Optional[Union[str, int]] = Field(default=None, description="店铺ID")
     user_id: Optional[Union[str, int]] = Field(default=None, description="用户ID（账号ID）")
     recipient_uid: Optional[str] = Field(default=None, description="接收转接的用户UID")
@@ -34,7 +35,15 @@ def transfer_conversation(params: TransferConversationParams) -> str:
         if not all([params.shop_id, params.user_id, params.recipient_uid]):
             return "转接失败：缺少必要的会话信息"
 
-        sender = get_sender()
+        # 渠道取自受信任注入的 channel_type（与 send_goods_link 同一范式），
+        # 不再无参调用 get_sender() —— 那样抖音会话会拿到拼多多发送器，
+        # 用 douyin_ 的 shop_id 去查拼多多库必然报「未找到店铺」。
+        from Agent.CustomerAgent.tools.channel_router import normalize_channel
+
+        sender = get_sender(normalize_channel(params.channel_type))
+        if not sender:
+            return "转接失败：当前渠道无可用发送器"
+
         cs_list = sender.get_cs_list(str(params.shop_id), str(params.user_id))
         my_cs_uid = f"cs_{params.shop_id}_{params.user_id}"
         if cs_list and isinstance(cs_list, dict):

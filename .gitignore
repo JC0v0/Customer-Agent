@@ -63,3 +63,6 @@ CLAUDE.md
 
 # 本地文档（设计说明、协议参考等，不纳入版本库）
 docs/
+
+# 抓包用的浏览器用户目录（含 Cookies / Login Data 等真实登录凭据，禁止入库）
+tools/reverse_probe/douyin/profile_v2/

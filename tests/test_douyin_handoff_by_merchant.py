@@ -1,35 +1,13 @@
 # -*- coding: utf-8 -*-
-"""商家侧消息 → 静默转人工 回归测试。
+"""抖音商家侧消息处理回归测试（对齐拼多多）。
 
-对齐拼多多：人工客服（或客服工作台）在会话里发出任何消息，就静默标记该会话
-转人工，AI 不再回复、也不通知。抖音没有 from_uid 白名单，只能靠「本程序发出
-记录」区分 AI 自己的回声，这里是那条边界的守门测试。
+商家侧消息（人工客服、系统提示、店铺机器人）不回复、不转人工。
 """
 import json
 
-import pytest
-
-import core.session_state as session_state_module
 from Channel.douyin import message_rules
 from Channel.douyin.core.douyin_lifecycle import LifecycleMixin
 from bridge.context import ChannelType, make_handoff_key
-from core.session_state import SessionState
-
-
-@pytest.fixture(autouse=True)
-def _fixed_handoff_ttl(monkeypatch):
-    """本机 config.json 的 handoff.valid_hours 是 0（标记立即过期）。
-
-    转人工时长属于部署配置，测试不该被它拖累，这里固定成 4 小时。
-    """
-    original = session_state_module.get_config
-
-    def patched(key, default=None):
-        if key == "handoff.valid_hours":
-            return 4
-        return original(key, default)
-
-    monkeypatch.setattr(session_state_module, "get_config", patched)
 
 
 class _FakeConvList:
@@ -77,42 +55,6 @@ def _merchant_ext(text_src="pc", biz_info='{"biz_role_type":"cs"}'):
     return ext
 
 
-class _RecordingLogger:
-    """LifecycleMixin 的 logger 由具体渠道类注入，测试里用记录桩替代。"""
-
-    def __init__(self):
-        self.records = []
-
-    def _push(self, level, message):
-        self.records.append((level, str(message)))
-
-    def debug(self, message):
-        self._push("debug", message)
-
-    def info(self, message):
-        self._push("info", message)
-
-    def warning(self, message):
-        self._push("warning", message)
-
-    def error(self, message):
-        self._push("error", message)
-
-    def messages(self, level):
-        out = []
-        for item_level, item_message in self.records:
-            if item_level == level:
-                out.append(item_message)
-        return out
-
-
-def _build_loop():
-    """直接用 LifecycleMixin 的实例，避免拉起整条连接。"""
-    loop = LifecycleMixin()
-    loop.logger = _RecordingLogger()
-    return loop
-
-
 def test_fetch_all_separates_merchant_from_buyer():
     from tools.reverse_probe.douyin.pigeon_conv_list import PigeonConvList
 
@@ -149,64 +91,21 @@ def test_fetch_all_separates_merchant_from_buyer():
     assert data["merchant"][0]["conv_id"] == "conv-1"
 
 
-def test_merchant_message_marks_handoff_with_conv_id():
-    """handoff key 的 uid 维度必须是 conv_id，否则 ai_handler 查不到。"""
-    loop = _build_loop()
-    shop_id = "13800138000"
-    session_key = make_handoff_key(ChannelType.DOUYIN, shop_id, "conv-1")
-    SessionState().clear_handoff(session_key)
+def test_lifecycle_has_no_handoff_by_merchant_any_more():
+    """商家侧消息不得再触发转人工（与拼多多一致）。"""
+    assert not hasattr(LifecycleMixin, "_mark_handoff_by_merchant")
 
-    item = {
-        "conv_id": "conv-1",
-        "text": "您好，我是客服",
-        "sender_kind": "human",
-        "src": "pc",
+
+def test_system_close_notice_is_not_agent_message():
+    """【系统关闭会话】是 role=4 的系统提示，不进商家侧分支，避免启动就刷日志。"""
+    notice = {
+        "type": 1005,
+        "sender_biz_role": "Shop",
+        "sender_role": "4",
+        "client_message_id": "close_user_msg_7707676989560272143",
+        "text": "【系统关闭会话】",
     }
-    loop._mark_handoff_by_merchant(item, shop_id, "13800138000")
-
-    assert SessionState().is_handoff(session_key) is True
-    SessionState().clear_handoff(session_key)
-
-
-def test_self_sent_echo_does_not_mark_handoff():
-    """AI 自己发出的回复回流成商家侧消息时，不能把自己判定为人工介入。"""
-    loop = _build_loop()
-    shop_id = "13800138000"
-    conv_id = "conv-self"
-    session_key = make_handoff_key(ChannelType.DOUYIN, shop_id, conv_id)
-    SessionState().clear_handoff(session_key)
-
-    message_rules.record_self_sent(shop_id, conv_id, "亲，这件是纯棉的")
-    item = {
-        "conv_id": conv_id,
-        "text": "亲，这件是纯棉的",
-        "sender_kind": "human",
-        "src": "pc",
-    }
-    loop._mark_handoff_by_merchant(item, shop_id, "13800138000")
-    assert SessionState().is_handoff(session_key) is False
-
-    # 指纹消费掉之后，客服再手工发同一句话，应当算人工介入。
-    loop._mark_handoff_by_merchant(item, shop_id, "13800138000")
-    assert SessionState().is_handoff(session_key) is True
-    SessionState().clear_handoff(session_key)
-
-
-def test_robot_message_does_not_mark_handoff():
-    loop = _build_loop()
-    shop_id = "13800138000"
-    conv_id = "conv-robot"
-    session_key = make_handoff_key(ChannelType.DOUYIN, shop_id, conv_id)
-    SessionState().clear_handoff(session_key)
-
-    item = {
-        "conv_id": conv_id,
-        "text": "欢迎光临本店",
-        "sender_kind": "robot",
-        "src": "pc",
-    }
-    loop._mark_handoff_by_merchant(item, shop_id, "13800138000")
-    assert SessionState().is_handoff(session_key) is False
+    assert message_rules.is_agent_message(notice) is False
 
 
 def test_handoff_key_matches_ai_handler_scope():
@@ -217,6 +116,7 @@ def test_handoff_key_matches_ai_handler_scope():
     expected = build("douyin", "shop-1", "conv-9")
     assert expected == "douyin|shop-1|conv-9"
     assert build(ChannelType.DOUYIN, "shop-1", "conv-9") == expected
+    assert make_handoff_key(ChannelType.DOUYIN, "shop-1", "conv-9") == expected
 
 
 def test_classify_merchant_sender():

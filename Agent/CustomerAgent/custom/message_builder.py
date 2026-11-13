@@ -153,17 +153,25 @@ class MessageBuilder:
             "recipient_nick": recipient_nick,
         }
 
-    def fetch_product_list_text(self, shop_id: Any, user_id: Any) -> str:
+    def fetch_product_list_text(
+        self, shop_id: Any, user_id: Any, channel_type: str = ""
+    ) -> str:
         """同步获取商品列表文本。
 
-        含拼多多 HTTP 调用，应由调用方放在工作线程中执行
+        含各渠道商品查询，应由调用方放在工作线程中执行
         （如 asyncio.to_thread），避免阻塞事件循环。
+
+        【必须传 channel_type】否则 GetShopProductsParams 的渠道为空，
+        normalize_channel 会回退到拼多多，抖音会话会拿 douyin_xxx 的
+        shop_id 去查拼多多库，必然报「无法在数据库中找到账户」。
         """
         if not shop_id or not user_id:
             return ""
 
         try:
-            params = GetShopProductsParams(shop_id=shop_id, user_id=user_id)
+            params = GetShopProductsParams(
+                shop_id=shop_id, user_id=user_id, channel_type=channel_type or None
+            )
             product_list_text = get_shop_products(params)
             # 添加说明：仅展示第一页商品
             product_list_text += "\n注：以上仅展示第一页商品，如果用户需要查看更多商品，请调用 get_shop_products 工具获取更多。"

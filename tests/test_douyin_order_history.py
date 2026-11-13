@@ -58,6 +58,10 @@ class DouyinOrderHistoryTests(unittest.TestCase):
 
             self.assertEqual(order_ids, ["6912345678901234567"])
 
+            # Windows 下 SQLite 连接未释放会让临时目录删除报 WinError 32，
+            # addCleanup 要等 with 块退出后才执行，这里先显式释放。
+            engine.dispose()
+
 
 if __name__ == "__main__":
     unittest.main()

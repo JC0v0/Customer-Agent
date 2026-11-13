@@ -15,13 +15,19 @@ DouyinLogin.login() 流程：
 
 浏览器启动（本地 Chrome/Edge 探测、CDP 回退、profile 锁清理等）沿用原实现。
 """
+import inspect
 import os
+import sqlite3
 # 必须在导入 playwright 之前设置浏览器路径
 from pathlib import Path
 from utils.path_utils import get_app_dir
 from utils.runtime_path import get_data_path
 from utils.logger_loguru import get_logger
-from Channel.douyin.session_paths import pigeon_session_path
+from Channel.douyin.session_paths import (
+    legacy_pigeon_session_path,
+    pigeon_capture_path,
+    pigeon_session_path,
+)
 
 # 设置 Playwright 浏览器路径
 app_dir = get_app_dir()
@@ -52,16 +58,21 @@ if getattr(_sys, "frozen", False):
 del _sys
 
 import json
+import base64
 import hashlib
 import asyncio
+import sys
 import socket
 import subprocess
+import ctypes
+import time
+from ctypes import wintypes
 import threading
 import urllib.request
 import re
 import shutil
 from urllib.parse import urlsplit, parse_qs
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 from database import db_manager
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -112,32 +123,248 @@ def _profile_scope_matches_username(profile_scope: Optional[str], username) -> b
         return False
 
 
-class _CdpContextHandle:
-    """包装 CDP 连接的 context，close() 时同时终止手动启动的浏览器进程。"""
+# ---------------------------------------------------------------------------
+# 进程清理：全部走 Win32 API，不启动 taskkill / netstat 这类外部程序。
+#
+# 原因（真机实测）：打包后的程序把 _internal 目录塞进了 PATH，系统自带的
+# taskkill.exe 启动时会加载到冲突 DLL，直接报 0xc0000142「应用程序无法正常
+# 启动」；而且无控制台的 GUI 程序每 spawn 一次就弹一个黑窗。于是清理完全
+# 失效、窗口越弹越多。改用 kernel32 / iphlpapi 的接口后既不会弹窗，也不受
+# 打包环境的 PATH 影响。
+# ---------------------------------------------------------------------------
+_IS_WINDOWS = sys.platform == "win32"
 
-    def __init__(self, context, proc):
+_PROCESS_TERMINATE = 0x0001
+_TH32CS_SNAPPROCESS = 0x00000002
+_AF_INET = 2
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+
+if _IS_WINDOWS:
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+
+    # 64 位下句柄必须声明成 HANDLE，否则默认 c_int 会截断
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    class _MIB_TCPROW_OWNER_PID(ctypes.Structure):
+        _fields_ = [
+            ("dwState", wintypes.DWORD),
+            ("dwLocalAddr", wintypes.DWORD),
+            ("dwLocalPort", wintypes.DWORD),
+            ("dwRemoteAddr", wintypes.DWORD),
+            ("dwRemotePort", wintypes.DWORD),
+            ("dwOwningPid", wintypes.DWORD),
+        ]
+
+    def _all_process_parent_pairs():
+        """取一份 (pid, 父pid) 快照。"""
+        pairs = []
+        snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        invalid = ctypes.c_void_p(-1).value
+        if not snapshot or snapshot == invalid:
+            return pairs
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            ok = _kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                pairs.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+                ok = _kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        except Exception:
+            return pairs
+        finally:
+            _kernel32.CloseHandle(snapshot)
+        return pairs
+
+    def _child_pids(parent_pid):
+        """递归收集所有子孙进程 pid。"""
+        pairs = _all_process_parent_pairs()
+        children = []
+        frontier = [int(parent_pid)]
+        while frontier:
+            current = frontier.pop()
+            for pid, ppid in pairs:
+                if ppid == current and pid not in children:
+                    children.append(pid)
+                    frontier.append(pid)
+        return children
+
+    def _terminate_pid(pid):
+        handle = _kernel32.OpenProcess(_PROCESS_TERMINATE, False, int(pid))
+        if not handle:
+            return
+        try:
+            _kernel32.TerminateProcess(handle, 1)
+        finally:
+            _kernel32.CloseHandle(handle)
+
+else:
+    def _child_pids(parent_pid):
+        return []
+
+    def _terminate_pid(pid):
+        return None
+
+
+def _kill_process_tree(pid):
+    """强杀进程树（含子孙）。pid 已退出时静默忽略。"""
+    if not pid or not _IS_WINDOWS:
+        return
+    try:
+        targets = _child_pids(pid)
+    except Exception:
+        targets = []
+    targets.append(int(pid))
+    for target in targets:
+        try:
+            _terminate_pid(target)
+        except Exception:
+            pass
+
+
+def _pid_listening_on_port(port):
+    """从调试端口反查浏览器真身 pid。
+
+    启动器进程退出后，唯一还和我们对得上的线索就是那个调试端口——
+    它的监听者就是真正的浏览器进程。直接读系统 TCP 表，不调 netstat。
+    """
+    if not port or not _IS_WINDOWS:
+        return None
+    try:
+        size = wintypes.DWORD(0)
+        _iphlpapi.GetExtendedTcpTable(
+            None, ctypes.byref(size), False, _AF_INET,
+            _TCP_TABLE_OWNER_PID_LISTENER, 0,
+        )
+        if not size.value:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        result = _iphlpapi.GetExtendedTcpTable(
+            buffer, ctypes.byref(size), False, _AF_INET,
+            _TCP_TABLE_OWNER_PID_LISTENER, 0,
+        )
+        if result != 0:
+            return None
+        count = ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD)).contents.value
+        first_row = ctypes.byref(buffer, ctypes.sizeof(wintypes.DWORD))
+        rows = ctypes.cast(first_row, ctypes.POINTER(_MIB_TCPROW_OWNER_PID))
+        wanted = int(port)
+        for index in range(count):
+            row = rows[index]
+            # dwLocalPort 是网络字节序，低 16 位才是端口
+            local_port = ((row.dwLocalPort & 0xFF) << 8) | ((row.dwLocalPort >> 8) & 0xFF)
+            if local_port == wanted:
+                return int(row.dwOwningPid)
+    except Exception:
+        return None
+    return None
+
+
+class _CdpContextHandle:
+    """包装 CDP 连接的 context，close() 时同时终止手动启动的浏览器进程。
+
+    两个坑导致关闭失败、窗口一直留在桌面上：
+
+    1. connect_over_cdp 连上的浏览器属于「连接」而非「启动」，
+       browser.close() 只断开连接，不会关窗口，必须发 CDP 的 Browser.close。
+    2. 手动 Popen 出来的 msedge 启动器进程常常在移交工作后立刻退出，
+       proc.poll() 不再是 None，原来的 `poll() is None` 判断把强杀整段跳过，
+       真正的浏览器进程就成了没人管的孤儿。
+
+    残留进程还会一直占着 user_data 目录，导致之后 migrate_profile 复制 profile
+    长期失败（每次登录白等十几秒）。所以这里改成：先 CDP 关浏览器，再按 pid 强杀，
+    最后按调试端口反查真身兜底。
+    """
+
+    def __init__(self, context, proc, browser=None, user_data_dir=None, port=None):
         self._context = context
         self._proc = proc
+        self._browser = browser
+        self._user_data_dir = user_data_dir
+        self._port = port
 
     def __getattr__(self, name):
         return getattr(self._context, name)
 
     async def close(self):
+        session = None
+        pids = []
+        if self._browser is not None:
+            try:
+                session = await self._browser.new_browser_cdp_session()
+                info = await session.send("SystemInfo.getProcessInfo")
+                processes = (info or {}).get("processInfo") or []
+                for item in processes:
+                    pid = item.get("id")
+                    if pid:
+                        pids.append(int(pid))
+            except Exception:
+                session = None
+
+        # 让浏览器自己退出（Browser.close 会关掉所有窗口和子进程）
+        if session is not None:
+            try:
+                await session.send("Browser.close")
+            except Exception:
+                pass
         try:
             await self._context.close()
         except Exception:
             pass
-        if self._proc and self._proc.poll() is None:
-            try:
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(self._proc.pid)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+
+        # 兜底强杀：CDP 报出来的每个 pid
+        # 启动器只在还活着时才按 pid 杀：它可能早就退出，pid 被系统回收后
+        # 再 OpenProcess 就会误伤别的进程。
+        if self._proc is not None and self._proc.poll() is None:
+            await asyncio.to_thread(_kill_process_tree, self._proc.pid)
+        for pid in pids:
+            await asyncio.to_thread(_kill_process_tree, pid)
+
+        # 最后一道：CDP 全程没连上时（pids 为空），按调试端口找真身再杀一次。
+        # 这一步是「窗口一直不关」的最终防线。
+        if not pids:
+            pid_by_port = await asyncio.to_thread(_pid_listening_on_port, self._port)
+            if pid_by_port:
+                await asyncio.to_thread(_kill_process_tree, pid_by_port)
+
+
+def _captured_frame_cmds(frames: List[Dict[str, Any]]) -> set:
+    """解析录帧列表里出现过的命令号集合（顶层 f1 varint）。"""
+    try:
+        from tools.reverse_probe.douyin.pigeon_proto import parse_fields
+    except Exception:
+        return set()
+    cmds = set()
+    for item in frames:
+        try:
+            fields = parse_fields(base64.b64decode(item.get("b64") or ""))
+            cmd = next((v for f, wt, v, _ in fields if f == 1 and wt == 0), None)
+        except Exception:
+            continue
+        if cmd is not None:
+            cmds.add(int(cmd))
+    return cmds
 
 
 class DouyinLogin():
@@ -145,6 +372,13 @@ class DouyinLogin():
     LOGIN_URL = "https://fxg.jinritemai.com/login/common"
     WORKSPACE_URL = "https://im.jinritemai.com/pc_seller_v2/main/workspace"
     DEFAULT_ACCESS_KEY = "975a9f0608893b4a902dbe8a8532f6c8"
+    # pigeon 录帧合格线：握手帧命令号小于注册帧 10011。帧号随客户端版本
+    # 变（10008/10009、10010、10005/10006 都实测出现过），不再写死。
+    # 10011 注册帧不要求（shop_id 在加密 blob 里，无法跨会话合成；
+    # 缺它只少 WS 实时推送，消息正文有 HTTP 拉取兜底）。
+    # 抓 pigeon 凭据的最大轮数。首轮常因「登录刚完成、会话 cookie 未落地」
+    # 被工作台踢回，抓不到 token；第二轮必成功（真机 2026-11-13）。
+    CAPTURE_ATTEMPTS = 2
 
     def __init__(self, name, password, profile_scope=None):
         self.logger = get_logger("Douyin_login")
@@ -158,27 +392,162 @@ class DouyinLogin():
         self.shop_id: Optional[str] = None
         self.shop_logo: Optional[str] = None
 
-    def _profile_dir(self, profile_scope: Optional[str] = None) -> Path:
-        """Return a filesystem-safe, stable profile path for this account."""
-        raw_name = str(profile_scope or self.profile_scope or self.name or "").strip()
+    @staticmethod
+    def _dir_for_raw_name(raw_name: str) -> Path:
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[:48]
         safe_name = safe_name or "account"
         digest = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:12]
         return data_dir / "user_data" / f"{safe_name}-{digest}"
 
+    def _legacy_profile_dir(self, profile_scope: Optional[str]) -> Path:
+        """旧版按 douyin:shop:user 算出来的 profile 目录。"""
+        return self._dir_for_raw_name(str(profile_scope or "").strip())
+
+    def _profile_dir(self, profile_scope: Optional[str] = None) -> Path:
+        """登录用的浏览器 profile 永远只按登录名算一个目录。
+
+        2026-11-14 修复「每次启动都要重新发短信验证码」：旧实现把
+        profile_scope 混进路径，添加账号时 login_douyin 不传 scope（写
+        按用户名算的 A 目录），运行时刷新/重登传 scope（读按 shop:user
+        算的 B 目录）。B 是空壳，打开登录页不会自动跳走，于是被判成
+        未登录去要验证码；migrate_profile 又因为 B 已存在而整段跳过。
+        浏览器登录态跟店铺维度无关，统一到一个目录即可根治。协议凭据
+        dy_session_* / dy_send_capture_* 仍按 scope 隔离，互不影响。
+        """
+        return self._dir_for_raw_name(str(self.name or "").strip())
+
     def migrate_profile(self, profile_scope: str) -> None:
-        """Copy a legacy username profile to its account-scoped location."""
-        source = self._profile_dir()
-        target = self._profile_dir(profile_scope)
-        if source.resolve() == target.resolve() or not source.exists() or target.exists():
+        """把旧版 scope 目录里的登录态迁到统一目录（只补关键文件）。
+
+        Edge 的 cookie 值由 Local State 里的 DPAPI 密钥加密，所以这两个
+        文件必须成对复制；只搬 Cookies 会解不出值。统一目录已经有
+        Cookies 时不覆盖，避免用旧会话盖掉新会话。
+        """
+        if not profile_scope:
             return
+        source = self._legacy_profile_dir(profile_scope)
+        target = self._profile_dir()
+        if source.resolve() == target.resolve():
+            return
+        source_cookies = source / "Default" / "Network" / "Cookies"
+        target_cookies = target / "Default" / "Network" / "Cookies"
+        if not source_cookies.exists() or target_cookies.exists():
+            return
+        rel_files = [
+            Path("Local State"),
+            Path("Default") / "Network" / "Cookies",
+            Path("Default") / "Preferences",
+        ]
+        copied = 0
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source, target)
+            for rel in rel_files:
+                src = source / rel
+                if not src.exists():
+                    continue
+                dst = target / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
         except OSError as exc:
             self.logger.warning(
-                f"browser profile migration skipped: error_type={type(exc).__name__}"
+                f"browser profile migration incomplete: error_type={type(exc).__name__}"
             )
+            return
+        if copied:
+            self.logger.info(
+                f"已迁移旧版浏览器登录态: {source.name} -> {target.name}"
+            )
+
+    def _saved_session_candidates(self):
+        """按新到旧列出可能存着完整 cookies 的会话文件。"""
+        paths = []
+        if self.profile_scope:
+            paths.append(pigeon_session_path(self.profile_scope, self.name))
+        paths.append(pigeon_session_path(None, self.name))
+        paths.append(legacy_pigeon_session_path())
+        return paths
+
+    # 判定「浏览器里还留着登录态」必须看关键 cookie，不能只看 Cookies 文件
+    # 在不在。CDP 收尾会发 Browser.close 再强杀进程树，cookie 常来不及
+    # 落盘：2026-11-14 03:36 真机 profile 里只剩 14 条基础项，文件依然
+    # 存在且非空，但 sessionid / sid_guard / passport_auth_status 全没有，
+    # 点「验证」就又停在登录页去发短信验证码。
+    _LOGIN_COOKIE_MARKERS = ("sessionid", "sid_guard", "passport_auth_status")
+
+    def _has_valid_login_cookies(self) -> bool:
+        """统一 profile 里是否存着能免验证的关键登录 cookie。"""
+        cookies = self._profile_dir() / "Default" / "Network" / "Cookies"
+        if not cookies.exists() or cookies.stat().st_size == 0:
+            return False
+        uri = "file:" + str(cookies).replace("\\", "/") + "?mode=ro"
+        try:
+            con = sqlite3.connect(uri, uri=True, timeout=1.0)
+            rows = con.execute("select name from cookies").fetchall()
+            con.close()
+        except Exception as exc:
+            self.logger.debug(
+                f"读取 profile cookies 失败，按无登录态处理: "
+                f"error_type={type(exc).__name__}"
+            )
+            return False
+        for row in rows:
+            name = str(row[0]).lower()
+            for marker in self._LOGIN_COOKIE_MARKERS:
+                if marker in name:
+                    return True
+        return False
+
+    async def _inject_saved_cookies(
+        self, context, profile_has_login_cookies: bool = False
+    ) -> int:
+        """把上次登录抓到的完整 cookies 注入当前浏览器上下文。
+
+        只在 profile 里没有关键登录 cookie 时注入：session 文件里的 cookies
+        可能比浏览器里的旧，无条件覆盖会把有效会话盖坏。真机复现结论
+        （2026-11-14 03:40）：profile 只剩 14 条基础 cookie 时访问登录页
+        会停住，注入 dy_session_*.json 的 70 条后自动跳到
+        ffa/mshop/homepage，也就是免掉了一次短信验证码。
+        domain 沿用页面桥里真机验证过的 .jinritemai.com。
+        """
+        if profile_has_login_cookies:
+            return 0
+        cookies_full = None
+        for path in self._saved_session_candidates():
+            try:
+                if not path.exists():
+                    continue
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                candidate = raw.get("cookies_full")
+                if isinstance(candidate, dict) and candidate:
+                    cookies_full = candidate
+                    break
+            except Exception as exc:
+                self.logger.debug(
+                    f"读取会话 cookies 跳过: error_type={type(exc).__name__}"
+                )
+        if not cookies_full:
+            return 0
+        payload = []
+        for key in cookies_full:
+            payload.append({
+                "name": str(key),
+                "value": str(cookies_full[key]),
+                "domain": ".jinritemai.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+            })
+        try:
+            result = context.add_cookies(payload)
+            if inspect.isawaitable(result):
+                await result
+            self.logger.info(f"已注入已保存的浏览器 cookies: {len(payload)} 个")
+            return len(payload)
+        except Exception as exc:
+            self.logger.warning(
+                f"注入浏览器 cookies 失败: error_type={type(exc).__name__}"
+            )
+            return 0
 
     # 本地浏览器启动参数（Chrome/Edge 通用）
     _LAUNCH_ARGS = [
@@ -334,6 +703,11 @@ class DouyinLogin():
         ready = False
         for _ in range(50):
             if proc.poll() is not None:
+                # 启动器退出不等于浏览器没起来（Edge 会移交给子进程），
+                # 只要端口还有人听就继续等，否则清理掉再放弃。
+                if _pid_listening_on_port(port):
+                    ready = True
+                    break
                 self._log_proc_stderr(
                     stderr_chunks, drain_thread,
                     f"CDP 回退：浏览器进程已退出 pid={proc.pid} port={port}",
@@ -351,6 +725,7 @@ class DouyinLogin():
         if not ready:
             if proc.poll() is None:
                 proc.terminate()
+            _kill_process_tree(_pid_listening_on_port(port))
             self._log_proc_stderr(
                 stderr_chunks, drain_thread,
                 f"CDP 回退：等待 CDP 端点超时 port={port}",
@@ -363,10 +738,18 @@ class DouyinLogin():
             )
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             self.logger.info(f"CDP 回退连接成功（端口 {port}）")
-            return _CdpContextHandle(context, proc)
+            return _CdpContextHandle(
+                context,
+                proc,
+                browser=browser,
+                user_data_dir=user_data_dir,
+                port=port,
+            )
         except Exception as e:
             if proc.poll() is None:
                 proc.terminate()
+            # 启动器可能已退出，浏览器还活着占着 profile：按端口把真身找出来清掉
+            _kill_process_tree(_pid_listening_on_port(port))
             self._log_proc_stderr(
                 stderr_chunks, drain_thread,
                 f"CDP 回退连接失败: {type(e).__name__}",
@@ -425,16 +808,24 @@ class DouyinLogin():
         playwright = None
         context = None
         try:
+            self.migrate_profile(self.profile_scope)
             playwright = await async_playwright().start()
             user_data_dir = str(self._profile_dir())
             self.logger.debug(f"使用用户数据目录: {user_data_dir}")
+            had_login_cookies = self._has_valid_login_cookies()
             context = await self._launch_context(playwright, user_data_dir, headless=headless)
+            await self._inject_saved_cookies(context, had_login_cookies)
             page = await context.new_page()
 
             # ---- 1. 打开登录页，按 URL 判断登录态（未登录访问 workspace 会空白卡死，
             #        故不再用 workspace 探测；已登录访问 login 页会自动跳走） ----
             await page.goto(DouyinLogin.LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(4000)
+            # 轮询等登录态判定：已登录访问 login 页会自动跳走，一旦离开
+            # 登录页立即继续（原来死等 4 秒）；真未登录时等满 4 秒再判定。
+            for _ in range(13):
+                await page.wait_for_timeout(300)
+                if not self._is_on_login_page(page):
+                    break
             if self._is_on_login_page(page):
                 self.logger.info("未登录，执行账号登录…")
                 logged = await self._do_login(page)
@@ -604,8 +995,105 @@ class DouyinLogin():
             await page.wait_for_timeout(2000)
 
     async def _capture_pigeon_session(self, page) -> Optional[Dict[str, Any]]:
-        """跳转飞鸽工作台，挂 WS 捕获 token/pigeon_sign/device_id。"""
+        """跳转飞鸽工作台，挂 WS 捕获 token/pigeon_sign/device_id + 录制 WS 帧。
+
+        帧录制是「下载即用」的关键：握手帧和注册帧（10011）只在真实登录
+        会话里出现，注册帧里带着店铺归属。录下来存盘后，运行时传输层直接
+        复用，新机器不再需要手工抓包。
+
+        录制用 CDP 的 ``Network.webSocketFrameSent`` 而不是 Playwright 的
+        ``framesent`` 事件：framesent 要等 websocket 事件回调挂上监听才开始
+        收，而握手帧在连接建立瞬间就发出去了，实测必漏（真机复盘
+        2026-11-13：framesent 只录到 10009/10010，体检报缺握手/注册帧）。
+        CDP 在导航前开 Network 域，从页面第一个帧起全量捕获，无竞态。
+        """
+        from tools.reverse_probe.douyin.pigeon_assets import (
+            PIGEON_WS_HOST_MARK,
+            is_handshake_cmd,
+        )
+
         captured: Dict[str, Any] = {}
+        ws_frames: List[Dict[str, Any]] = []
+        # 命令号无法区分连接归属：工作台页面还会连 frontier.snssdk.com，
+        # 那条连接的帧命令号同样落在 10000 段（实测掺进过 10012/10016）。
+        # 这里用 webSocketCreated 建 requestId -> url 映射，只留 pigeon 连接。
+        unattributed: List[Dict[str, Any]] = []
+
+        async def _attach_cdp(target):
+            """给任意 target（页面/Worker/ServiceWorker）挂帧录制。
+
+            真机复盘 2026-11-13：只挂页面时每轮只录到一对帧
+            （10010+10011 同毫秒发出），完整握手序列缺失——部分帧发自
+            Worker 线程，它们有独立 CDP target，页面级会话看不到。
+            """
+            ws_urls: Dict[str, str] = {}
+
+            def on_ws_created(params):
+                rid = params.get("requestId")
+                url = params.get("url") or ""
+                if rid:
+                    ws_urls[rid] = url
+                self.logger.debug("CDP WS 建立: %s", url[:90])
+
+            def on_frame(params):
+                resp = params.get("response") or {}
+                # opcode 2 = 二进制帧，CDP 的 payloadData 是 base64 串
+                if resp.get("opcode") != 2 or not resp.get("payloadData"):
+                    return
+                item = {
+                    "b64": resp["payloadData"],
+                    "ts": int(time.time() * 1000),
+                }
+                url = ws_urls.get(params.get("requestId") or "", "")
+                if PIGEON_WS_HOST_MARK in url:
+                    ws_frames.append(item)
+                elif url:
+                    self.logger.debug("跳过非 pigeon 连接帧: %s", url[:70])
+                else:
+                    # 连接在 Network.enable 之前就建好了，拿不到 url。
+                    # 先存着，最后只有一条 pigeon 帧都没录到时才用它兜底。
+                    unattributed.append(item)
+
+            try:
+                s = await page.context.new_cdp_session(target)
+                await s.send("Network.enable")
+                s.on("Network.webSocketCreated", on_ws_created)
+                s.on("Network.webSocketFrameSent", on_frame)
+                self.logger.debug("CDP 录帧已挂到 %s", type(target).__name__)
+            except Exception as e:
+                self.logger.debug(
+                    "CDP 录帧挂载失败(%s): %s", type(target).__name__,
+                    type(e).__name__,
+                )
+
+        # 页面本体
+        cdp_ok = False
+        try:
+            await _attach_cdp(page)
+            cdp_ok = True
+        except Exception as e:
+            self.logger.warning(f"CDP 帧录制挂载失败: {type(e).__name__}")
+
+        # 页面里的 Web Worker / Service Worker（可能承载 pigeon 连接）
+        loop = asyncio.get_event_loop()
+
+        def _attach_existing_workers():
+            for w in list(page.workers):
+                loop.create_task(_attach_cdp(w))
+            try:
+                for sw in list(page.context.service_workers):
+                    loop.create_task(_attach_cdp(sw))
+            except Exception:
+                pass
+
+        _attach_existing_workers()
+        page.on("worker", lambda w: loop.create_task(_attach_cdp(w)))
+        try:
+            page.context.on(
+                "serviceworker", lambda sw: loop.create_task(_attach_cdp(sw))
+            )
+        except Exception:
+            pass
 
         def on_ws(ws):
             url = ws.url or ""
@@ -621,15 +1109,99 @@ class DouyinLogin():
                     f"pigeon_sign={captured['pigeon_sign'][:14]}..."
                 )
 
+                # CDP 不可用时退回 framesent（有竞态，可能漏握手帧，
+                # 但比完全不录好）。
+                if not cdp_ok:
+                    def on_frame(payload):
+                        if isinstance(payload, (bytes, bytearray)) and payload:
+                            ws_frames.append({
+                                "b64": base64.b64encode(bytes(payload)).decode("ascii"),
+                                "ts": int(time.time() * 1000),
+                            })
+
+                    try:
+                        ws.on("framesent", on_frame)
+                    except Exception as e:
+                        self.logger.warning(f"WS 帧录制挂载失败: {type(e).__name__}")
+
+        # 先落到空白页：登录跳转可能已经把页面带到工作台、WS 早已建好
+        # （真机复盘 2026-11-13：CDP 开好后录到的只有旧连接的 10010/10011，
+        # 握手帧在监听开始前就发完了）。导航离开会关闭本页旧连接，
+        # 之后每轮 goto 都是一次全新的 WS 生命周期，CDP 全程可见。
+        try:
+            await page.goto("about:blank", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(800)
+        except Exception as e:
+            self.logger.debug(f"about:blank 预跳转失败（继续）: {type(e).__name__}")
+
         page.on("websocket", on_ws)
-        await page.goto(DouyinLogin.WORKSPACE_URL, wait_until="domcontentloaded", timeout=60000)
-        deadline = asyncio.get_event_loop().time() + 40
-        while asyncio.get_event_loop().time() < deadline:
+        # 单轮录制：goto 工作台后等首个握手/认证帧（实测 1-2 秒内出现），
+        # 再留 2 秒收尾凑后续帧，最多 10 秒。旧版 3 轮×12 秒的重试是在
+        # 等一个永远等不到的 10011（注册帧只在部分客户端版本发出），
+        # 白白让用户在「登录完成→浏览器关闭」之间多等 40 多秒。
+        #
+        # 但「抓不到凭据」必须重试一轮（2026-11-13 真机）：短信验证刚通过时
+        # 会话 cookie 还没完全生效，此时导航到工作台会被踢回、页内显示
+        # 「登录失败」，token 抓不到 → 判登录失败，用户得点第二次验证。
+        # 第二轮 cookie 已落地，必进工作台。只有失败才多花时间。
+        for attempt in range(DouyinLogin.CAPTURE_ATTEMPTS):
+            if attempt > 0:
+                self.logger.warning(
+                    "首轮未抓到 pigeon 凭据（登录刚完成时工作台常提示「登录失败」），"
+                    "等待 1.5 秒让会话落地后重试"
+                )
+                await page.wait_for_timeout(1500)
+            try:
+                await page.goto(
+                    DouyinLogin.WORKSPACE_URL,
+                    wait_until="domcontentloaded", timeout=60000,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"工作台导航失败（第 {attempt + 1} 轮）: {type(e).__name__}"
+                )
+                continue
+            round_start = asyncio.get_event_loop().time()
+            round_deadline = round_start + 10
+            first_frame_at = None
+            while asyncio.get_event_loop().time() < round_deadline:
+                await page.wait_for_timeout(300)
+                got = _captured_frame_cmds(ws_frames)
+                if got:
+                    if first_frame_at is None:
+                        first_frame_at = asyncio.get_event_loop().time()
+                    elif asyncio.get_event_loop().time() - first_frame_at >= 2:
+                        break
+                # 被踢回登录页（会话未生效）时早退，不必白白等满 10 秒
+                elif asyncio.get_event_loop().time() - round_start > 2 \
+                        and not self._is_on_workspace(page):
+                    self.logger.debug(f"页面未停留在工作台: {page.url}")
+                    break
             if captured.get("token") and captured.get("pigeon_sign"):
                 break
-            await page.wait_for_timeout(1000)
+            self.logger.warning(
+                f"第 {attempt + 1} 轮未拿到 token/pigeon_sign，"
+                f"当前页面: {page.url}"
+            )
         if not captured.get("token") or not captured.get("pigeon_sign"):
             return None
+        if not ws_frames and unattributed:
+            # 极端情况：pigeon 连接在 Network.enable 之前就建好了，拿不到
+            # url。此时宁可带着可能掺了别的连接的帧，也好过完全没有帧。
+            self.logger.warning(
+                f"未按连接识别到 pigeon 帧（连接早于监听建立），"
+                f"回退使用未归因帧 {len(unattributed)} 条"
+            )
+            ws_frames.extend(unattributed)
+        got_cmds = _captured_frame_cmds(ws_frames)
+        # 帧号不再是判定依据：小于注册帧算握手帧；连这条规则都失效时，
+        # 只要有成对的帧就交给传输层按顺序发，别在这里就判死。
+        if not any(is_handshake_cmd(c) for c in got_cmds) and len(got_cmds) < 2:
+            self.logger.warning(
+                f"录帧未捕获任何握手/认证帧（已录到 {sorted(got_cmds)}），"
+                f"通道启动可能被体检拦下"
+            )
+        self._save_pigeon_capture(ws_frames, ws_host=PIGEON_WS_HOST_MARK)
 
         # ---- 完整浏览器 cookies（backstage API 鉴权关键；pigeon_sign 仅对 pigeon_im 有效）----
         try:
@@ -703,6 +1275,31 @@ class DouyinLogin():
         with open(out, "w", encoding="utf-8") as f:
             json.dump(session, f, ensure_ascii=False, indent=1)
         self.logger.info(f"会话凭据已保存: {out}")
+
+    def _save_pigeon_capture(self, frames: List[Dict[str, Any]],
+                             ws_host: str = "") -> None:
+        """把登录时录到的 WS 帧存成按账号隔离的抓包文件。
+
+        文件落在 temp 目录（git 忽略），带真实凭据不入库。运行时
+        ``PigeonTransport`` 优先读它：握手/注册帧只能来自真实会话；
+        缺 10018 发送帧时传输层会用包内脱敏骨架兜底，所以录帧不全
+        不影响文本发送。
+        """
+        if not frames:
+            self.logger.warning(
+                "未录到任何 WS 帧（浏览器可能未建立 pigeon 连接），"
+                "发送帧模板将回退包内骨架，握手/注册帧可能缺失"
+            )
+            return
+        out = pigeon_capture_path(self.profile_scope, self.name)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        data = {"ws_sent": frames, "saved_at": int(time.time() * 1000)}
+        if ws_host:
+            # 记录来源连接，方便日后排查「录到的帧是不是 pigeon 的」
+            data["ws_host"] = ws_host
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        self.logger.info(f"WS 帧录制完成: {len(frames)} 帧 -> {out}")
 
     async def _extract_shop_name(self, page) -> Optional[str]:
         """从飞鸽工作台提取店铺名。
@@ -791,18 +1388,22 @@ class DouyinLogin():
         playwright = None
         context = None
         try:
+            self.migrate_profile(self.profile_scope)
             playwright = await async_playwright().start()
             user_data_dir = str(self._profile_dir())
             self.logger.debug(f"使用用户数据目录刷新cookies: {user_data_dir}")
-            if not os.path.exists(user_data_dir):
-                self.logger.error(f"用户数据目录不存在: {user_data_dir}，请先登录")
-                return False
-
+            # 目录不存在不再直接放弃：_launch_context 会新建，登录态由
+            # dy_session_*.json 注入回来，避免因为目录被清理就要短信验证码。
+            had_login_cookies = self._has_valid_login_cookies()
             context = await self._launch_context(playwright, user_data_dir, headless=True)
+            await self._inject_saved_cookies(context, had_login_cookies)
             page = await context.new_page()
             await page.goto(DouyinLogin.LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
-
+            # 同主流程：已登录会自动跳走，离开登录页即提前通过。
+            for _ in range(10):
+                await page.wait_for_timeout(300)
+                if not self._is_on_login_page(page):
+                    break
             if self._is_on_login_page(page):
                 self.logger.warning("登录状态已失效，需要重新登录")
                 return False

@@ -6,6 +6,17 @@ from typing import Optional, Any
 from utils.logger_loguru import get_logger
 
 
+class DouyinConfigError(RuntimeError):
+    """连接前置文件缺失（不是网络问题，重试也不会好）。
+
+    pigeon 纯协议需要三份 runtime 文件：账号会话凭据、WS 发送帧模板、
+    接收 body 模板。后两份是抓包产物，不随仓库分发，换机器就整体缺失。
+    这类错误按「配置缺失」直接失败，不要卷进 5 次退避重试——那样只会
+    反复重建消息队列（每次 10 个 worker），日志被刷屏，而界面上给出的
+    还是「请检查网络」，把排查方向带偏。
+    """
+
+
 class ConnectionMixin:
     """连接管理 Mixin
 
@@ -34,6 +45,17 @@ class ConnectionMixin:
                     logger.info(f"尝试重连 ({attempt + 1}/{self.reconnect_config.max_attempts}): {shop_id}-{username}")
 
                 await self._connect_single_attempt(shop_id, user_id, username, on_success, on_failure)
+                return
+
+            except DouyinConfigError as e:
+                # 缺文件不是网络问题：直接暴露原因并停下，不重试、不刷日志。
+                self.status_manager.update_status(
+                    shop_id, user_id, username, ConnectionState.ERROR, "config_missing"
+                )
+                logger.error(
+                    f"连接前置文件缺失，已停止重试: {shop_id}-{username}, {e}"
+                )
+                on_failure(str(e))
                 return
 
             except Exception as e:
